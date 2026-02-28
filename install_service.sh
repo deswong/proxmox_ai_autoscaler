@@ -21,6 +21,14 @@ if [ ! -f .env ]; then
   cp .env.example .env
 fi
 
+echo "Setting up centralized logging..."
+LOG_FILE="/var/log/proxmox_lxc_autoscaler.log"
+if [ ! -f "$LOG_FILE" ]; then
+    touch "$LOG_FILE"
+fi
+chown root:root "$LOG_FILE"
+chmod 644 "$LOG_FILE"
+
 echo "Creating systemd service file..."
 cat > "$SERVICE_FILE" << EOF
 [Unit]
@@ -54,5 +62,7 @@ echo ""
 echo "Then start the service:"
 echo "  systemctl start $SERVICE_NAME"
 echo ""
-echo "To view logs, use:"
-echo "  journalctl -u $SERVICE_NAME -f"
+echo "To view live logs, use:"
+echo "  tail -f /var/log/proxmox_lxc_autoscaler.log"
+echo "  (or: journalctl -u $SERVICE_NAME -f)"
+

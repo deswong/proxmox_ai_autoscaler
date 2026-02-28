@@ -27,6 +27,11 @@ class Predictor:
             
         # We want the most recent 15 valid data points for a smooth, fast trend
         metrics = valid_metrics[-15:]
+        
+        # Explicit memory optimization: We no longer need the heavy original RRD json array
+        # or the large filtered array. Free them before we spin up Scikit-Learn matrices.
+        del rrd_data
+        del valid_metrics
             
         if len(metrics) < 3:
             # Not enough data for a reliable trend, return the most recent reading
@@ -45,6 +50,9 @@ class Predictor:
         # or overall ratio. Multiply by 100 for percent.
         y_cpu = np.array([(m.get('cpu', 0.0) * 100) for m in metrics])
         y_ram = np.array([(m.get('mem', 0.0) / (1024 * 1024)) for m in metrics])
+        
+        # Explicit memory optimization: Free the intermediate array list
+        del metrics
         
         # Fit Linear Regression for CPU
         model_cpu = LinearRegression()

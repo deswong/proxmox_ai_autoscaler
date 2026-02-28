@@ -1,15 +1,34 @@
 import os
 import json
 import logging
-from dotenv import load_dotenv
+import logging.handlers
 
 load_dotenv()
 
 # Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('proxmox_autoscaler')
+logger.setLevel(logging.INFO)
+
+# Console Handler
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+logger.addHandler(console_handler)
+
+# Attempt to configure Rotating File Handler for /var/log
+LOG_FILE_PATH = "/var/log/proxmox_lxc_autoscaler.log"
+try:
+    file_handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE_PATH, maxBytes=5*1024*1024, backupCount=3
+    )
+    file_handler.setFormatter(log_formatter)
+    logger.addHandler(file_handler)
+except PermissionError:
+    logger.warning(f"Permission denied to write to {LOG_FILE_PATH}. Logging to console only until permissions are fixed by install script.")
+except Exception as e:
+    logger.error(f"Failed to setup file logging at {LOG_FILE_PATH}: {e}")
+
+# Map logger globally for this module
 logger = logging.getLogger("config")
 
 # Proxmox Credentials
