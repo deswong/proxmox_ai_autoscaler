@@ -117,3 +117,17 @@ class ProxmoxClient:
         except Exception as e:
             logger.error(f"Failed to fetch RRD history for LXC {lxc_id}: {e}")
             return []
+
+    def get_all_lxc_ids(self) -> list:
+        """
+        Returns a list of all LXC IDs currently existing on the target Proxmox node.
+        """
+        if not self.proxmox:
+            return []
+            
+        try:
+            lxcs = self.node.lxc.get()
+            return [str(lxc['vmid']) for lxc in lxcs]
+        except Exception as e:
+            logger.error(f"Failed to fetch list of LXCs from node {NODE_NAME}: {e}")
+            return []

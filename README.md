@@ -11,7 +11,27 @@ Zero database tuning, zero complex Prometheus stacks—just one service keeping 
 - **Batched Reinforcement Learning:** The underlying Machine Learning engine trains offline automatically every night, meaning the live scaling engine uses zero RAM and CPU on your Proxmox host.
 - **Native Proxmox Integration**: Uses Proxmox's internal `rrddata` graph APIs to pull usage metrics without needing custom local telemetry agents.
 - **Hotpluggable Safety**: Dynamically adjusts CPU cores and Memory allocation on-the-fly without container restarts.
-- **Persistent Baselines**: Minimum and maximum boundaries per LXC are easily defined in the `.env` using simple variables.
+## How it Works
+### 1. The XGBoost Engine & Batched Learning
+Machine learning requires significant RAM and CPU to build reliable matrices. Rather than stalling your hypervisor by training models continuously, this autoscaler is strictly separated into two components:
+1. **The Fast Inference Daemon (`main.py`)**: Runs every 60 seconds. It fetches the last 15 minutes of RRD metrics and passes them through a pre-trained `.json` model. This takes milliseconds and costs ~0% CPU. It logs the accuracy of its prediction into a local SQLite DB for later review.
+2. **The Batched Trainer (`train_models.py`)**: Runs once a day via cron (e.g. 3:00 AM). It downloads the last week (or month) of metrics and the logged prediction errors, mathematically calculating the Mean Absolute Error (MAE). It uses these heavy datasets to train a fresh `xgboost` regressor for every single LXC organically, writing the `.json` weights to disk for the inference daemon to seamlessly pick up the next morning.
+
+### 2. Overcommitting & The 95% Host Safeguard
+Proxmox allows you to allocate more CPU cores and RAM to containers than you physically possess on the motherboard (overcommitting). While this is great for virtualization, an aggressive AI could easily allocate 200% of your RAM across your containers and instantly crash the Proxmox Kernel out of memory (OOM).
+
+To prevent this, the autoscaler implements a **Hard 95.0% Emergency Stop**. During every single 60-second cycle, the daemon asks the Proxmox Node for its *true physical utilization*. If your server is currently using >95.0% of its physical RAM or CPU, the AI is mathematically forbidden from scaling any container *upward*, no matter how badly the container needs it. It will continue to scale containers *downward* to free up resources, eventually relieving the node. You can control this threshold in the `.env` via `MAX_HOST_CPU_ALLOCATION_PERCENT`.
+
+### 3. Zero-Config LXC Discovery
+You do not need to tell the autoscaler which containers to manage. By default, it queries the Proxmox API for every running LXC on the node.
+
+If it finds a container that is not strictly defined in your `.env` file, it assigns it a **Dynamic Baseline**:
+- **Min CPU:** 1
+- **Min RAM:** 512MB
+- **Max CPU:** Current Cores + 4
+- **Max RAM:** Current RAM * 2
+
+If you want to explicitly override these dynamic baselines for a specific container, or completely hide a container from the AI, edit the `.env` file mapping.
 
 ---
 

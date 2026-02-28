@@ -35,21 +35,41 @@ def run():
         
         # 1. (Legacy SQLite Telemetry Cleanup Removed)
         
-        # 2. Re-fetch baselines in case they were updated externally
-        baselines = storage.get_baselines()
+        # 2. Re-fetch explicit baselines (from .env/DB) and excluded lists
+        explicit_baselines = storage.get_baselines()
+        from config import EXCLUDED_LXCS, MAX_HOST_CPU_ALLOCATION_PERCENT, MAX_HOST_RAM_ALLOCATION_PERCENT
         
-        if not baselines:
-            logger.warning("No LXC baselines configured in database. Nothing to monitor.")
+        # 3. Discover all running LXCs on the hypervisor
+        all_lxc_ids = px_client.get_all_lxc_ids()
         
-        # 3. Evaluate each configured LXC
-        for lxc_id, baseline in baselines.items():
+        if not all_lxc_ids:
+            logger.warning("No LXCs found on this node. Nothing to monitor.")
+        
+        # 4. Evaluate each discovered LXC
+        for lxc_id in all_lxc_ids:
+            if lxc_id in EXCLUDED_LXCS:
+                logger.debug(f"[LXC {lxc_id}] Skipping (Listed in EXCLUDED_LXCS blacklist).")
+                continue
+                
             try:
                 # Fetch current telemetry from hypervisor
                 current_metrics = px_client.get_lxc_metrics(lxc_id)
                 if not current_metrics:
                     logger.debug(f"[LXC {lxc_id}] Is not running or could not fetch metrics. Skipping.")
                     continue
-                
+                    
+                # Determine baseline: Use explicit if it exists, otherwise build a dynamic one
+                if lxc_id in explicit_baselines:
+                    baseline = explicit_baselines[lxc_id]
+                else:
+                    # Dynamic Zero-Config Baseline Setup
+                    baseline = {
+                        "min_cpus": 1,
+                        "min_ram_mb": 512,
+                        "max_cpus": current_metrics["allocated_cpus"] + 4,
+                        "max_ram_mb": current_metrics["allocated_ram_mb"] * 2
+                    }
+                    logger.debug(f"[LXC {lxc_id}] Using dynamic fallback baseline: {baseline}")
                 # Retrieve recent RRD time-series graph directly from Proxmox
                 historical_metrics = px_client.get_lxc_rrd_history(lxc_id, timeframe="hour")
                 

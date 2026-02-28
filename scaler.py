@@ -51,13 +51,18 @@ class Scaler:
         # 3. Check physical node limits before scaling UP
         # Fetch live host node metrics
         host_metrics = self.px.get_host_usage()
-        if host_metrics['cpu_percent'] > MAX_HOST_CPU_ALLOCATION_PERCENT and target_cpus > current_metrics['allocated_cpus']:
-            logger.warning(f"[LXC {lxc_id}] Cannot scale CPU up. Host Node CPU is over threshold ({host_metrics['cpu_percent']:.1f}% > {MAX_HOST_CPU_ALLOCATION_PERCENT}%).")
+        
+        # Hardcoded emergency safeguard (caps user config at max 95%)
+        safe_cpu_limit = min(MAX_HOST_CPU_ALLOCATION_PERCENT, 95.0)
+        safe_ram_limit = min(MAX_HOST_RAM_ALLOCATION_PERCENT, 95.0)
+        
+        if host_metrics['cpu_percent'] > safe_cpu_limit and target_cpus > current_metrics['allocated_cpus']:
+            logger.warning(f"[LXC {lxc_id}] SAFETY CAP: Cannot scale CPU up. Host Node CPU is over threshold ({host_metrics['cpu_percent']:.1f}% > {safe_cpu_limit}%).")
             # Limit scale up to current allocation
             target_cpus = current_metrics['allocated_cpus']
             
-        if host_metrics['ram_percent'] > MAX_HOST_RAM_ALLOCATION_PERCENT and target_ram > current_metrics['allocated_ram_mb']:
-            logger.warning(f"[LXC {lxc_id}] Cannot scale RAM up. Host Node RAM is over threshold ({host_metrics['ram_percent']:.1f}% > {MAX_HOST_RAM_ALLOCATION_PERCENT}%).")
+        if host_metrics['ram_percent'] > safe_ram_limit and target_ram > current_metrics['allocated_ram_mb']:
+            logger.warning(f"[LXC {lxc_id}] SAFETY CAP: Cannot scale RAM up. Host Node RAM is over threshold ({host_metrics['ram_percent']:.1f}% > {safe_ram_limit}%).")
             # But we can allow scaling down RAM, just not UP.
             target_ram = current_metrics['allocated_ram_mb']
 

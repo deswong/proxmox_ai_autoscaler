@@ -39,11 +39,21 @@ def calculate_recent_penalties(lxc_id) -> dict:
 
 def train_for_lxc(px_client, lxc_id, models_dir="./models"):
     """
-    Pulls a week of RRD data, constructs the feature matrix, 
-    and trains an XGBoost model.
+    Pulls historical RRD data based on the configured lookback window,
+    constructs the feature matrix, and trains an XGBoost model.
     """
-    logger.info(f"Fetching weekly RRD data for LXC {lxc_id}...")
-    rrd_data = px_client.get_lxc_rrd_history(lxc_id, timeframe="week")
+    from config import TRAINING_DAYS_LOOKBACK
+    
+    # Proxmox API only accepts specific timeframe strings.
+    if TRAINING_DAYS_LOOKBACK <= 7:
+        timeframe = "week"
+    elif TRAINING_DAYS_LOOKBACK <= 30:
+        timeframe = "month"
+    else:
+        timeframe = "year"
+        
+    logger.info(f"Fetching {TRAINING_DAYS_LOOKBACK} days of RRD data ({timeframe}) for LXC {lxc_id}...")
+    rrd_data = px_client.get_lxc_rrd_history(lxc_id, timeframe=timeframe)
     
     valid_metrics = [m for m in rrd_data if m.get('cpu') is not None and m.get('mem') is not None]
     if len(valid_metrics) < 100:
@@ -104,12 +114,22 @@ def run():
         
     storage.init_db()
     
-    baselines = storage.get_baselines()
-    if not baselines:
-        logger.warning("No LXCs currently configured. Nothing to train.")
+    # 1. Get explicit baselines
+    explicit_baselines = storage.get_baselines()
+    from config import EXCLUDED_LXCS
+    
+    # 2. Discover all running LXCs on the node
+    all_lxc_ids = px_client.get_all_lxc_ids()
+    
+    if not all_lxc_ids:
+        logger.warning("No LXCs found on this node. Nothing to train.")
         return
         
-    for lxc_id in baselines.keys():
+    for lxc_id in all_lxc_ids:
+        if lxc_id in EXCLUDED_LXCS:
+            logger.debug(f"Skipping training for LXC {lxc_id} (Listed in EXCLUDED_LXCS).")
+            continue
+            
         try:
             train_for_lxc(px_client, lxc_id)
         except Exception as e:

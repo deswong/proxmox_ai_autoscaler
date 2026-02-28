@@ -39,8 +39,11 @@ PROXMOX_TOKEN_SECRET = os.getenv("PROXMOX_TOKEN_SECRET", "")
 NODE_NAME = os.getenv("NODE_NAME", "pve")
 
 # Scaling Settings
-MAX_HOST_CPU_ALLOCATION_PERCENT = float(os.getenv("MAX_HOST_CPU_ALLOCATION_PERCENT", 85.0))
-MAX_HOST_RAM_ALLOCATION_PERCENT = float(os.getenv("MAX_HOST_RAM_ALLOCATION_PERCENT", 85.0))
+MAX_HOST_CPU_ALLOCATION_PERCENT = min(float(os.getenv("MAX_HOST_CPU_ALLOCATION_PERCENT", 85.0)), 95.0)
+MAX_HOST_RAM_ALLOCATION_PERCENT = min(float(os.getenv("MAX_HOST_RAM_ALLOCATION_PERCENT", 85.0)), 95.0)
+
+# Training Settings
+TRAINING_DAYS_LOOKBACK = int(os.getenv("TRAINING_DAYS_LOOKBACK", 7))
 
 # Initial Baselines
 INITIAL_LXC_CONFIGS = {}
@@ -60,6 +63,11 @@ for key, value in os.environ.items():
                 logger.warning(f"Skipping {key}: Must have exactly 4 values (min_cpu, min_ram, max_cpu, max_ram)")
         except Exception as e:
             logger.error(f"Failed to parse environment variable {key}={value}. Error: {e}")
+
+# Excluded LXCs
+# Comma-separated list of LXC IDs to never autoscale
+_excluded_str = os.getenv("EXCLUDED_LXCS", "")
+EXCLUDED_LXCS = [x.strip() for x in _excluded_str.split(",") if x.strip()]
 
 DATABASE_PATH = os.getenv("DATABASE_PATH", "autoscaler.db")
 POLL_INTERVAL_SECONDS = 60
