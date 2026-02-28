@@ -1,0 +1,5 @@
+proxmoxer
+requests
+python-dotenv
+scikit-learn
+numpy

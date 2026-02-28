@@ -1,0 +1,58 @@
+#!/bin/bash
+
+# Ensure script is run as root
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run as root"
+  exit
+fi
+
+APP_DIR=$(pwd)
+SERVICE_NAME="lxc-autoscaler"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+
+echo "Creating python virtual environment and installing dependencies..."
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# Create .env from .env.example if it doesn't exist
+if [ ! -f .env ]; then
+  echo "Copying .env.example to .env (Remember to edit it!)"
+  cp .env.example .env
+fi
+
+echo "Creating systemd service file..."
+cat > "$SERVICE_FILE" << EOF
+[Unit]
+Description=Proxmox LXC AI Autoscaler Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=${APP_DIR}
+ExecStart=${APP_DIR}/venv/bin/python ${APP_DIR}/main.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "Reloading systemd daemon..."
+systemctl daemon-reload
+
+echo "Enabling $SERVICE_NAME to start on boot..."
+systemctl enable "$SERVICE_NAME"
+
+echo ""
+echo "Installation complete!"
+echo ""
+echo "Please edit the .env file with your actual Proxmox API connection details:"
+echo "  nano ${APP_DIR}/.env"
+echo ""
+echo "Then start the service:"
+echo "  systemctl start $SERVICE_NAME"
+echo ""
+echo "To view logs, use:"
+echo "  journalctl -u $SERVICE_NAME -f"
