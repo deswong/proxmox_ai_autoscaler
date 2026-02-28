@@ -17,3 +17,6 @@ Zero database tuning, zero complex Prometheus stacks—just one service keeping 
 1. Clone the repository into your Proxmox Host.
 2. `cp .env.example .env` and edit your API tokens and base limits.
 3. Run `sudo ./install_service.sh` to install the requirements and launch the `systemd` daemon!
+
+## Acknowledgments
+This project was inspired by [fabriziosalmi/proxmox-lxc-autoscale-ml](https://github.com/fabriziosalmi/proxmox-lxc-autoscale-ml).
