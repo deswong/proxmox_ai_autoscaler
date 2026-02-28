@@ -17,7 +17,7 @@ class Predictor:
         if not os.path.exists(models_dir):
             os.makedirs(models_dir)
         
-    def predict_next_usage(self, lxc_id: str, rrd_data: List[dict]) -> dict:
+    def predict_next_usage(self, entity_id: str, rrd_data: List[dict], entity_type: str = "LXC") -> dict:
         """
         Takes chronological data from Proxmox RRD API.
         Only performs fast inference using pre-trained XGBoost weights. 
@@ -56,8 +56,9 @@ class Predictor:
             }
             
         # Try to load models
-        cpu_model_path = os.path.join(self.models_dir, f"lxc_{lxc_id}_cpu.json")
-        ram_model_path = os.path.join(self.models_dir, f"lxc_{lxc_id}_ram.json")
+        prefix = entity_type.lower()
+        cpu_model_path = os.path.join(self.models_dir, f"{prefix}_{entity_id}_cpu.json")
+        ram_model_path = os.path.join(self.models_dir, f"{prefix}_{entity_id}_ram.json")
         
         pred_cpu = fallback_cpu
         pred_ram = fallback_ram
@@ -87,9 +88,9 @@ class Predictor:
                 del model_ram
 
             except Exception as e:
-                logger.error(f"Failed to run XGBoost inference for LXC {lxc_id}: {e}")
+                logger.error(f"Failed to run XGBoost inference for {entity_type} {entity_id}: {e}")
         else:
-            logger.debug(f"No XGBoost models found yet for LXC {lxc_id}. Falling back to live metrics.")
+            logger.debug(f"No XGBoost models found yet for {entity_type} {entity_id}. Falling back to live metrics.")
                 
         # Explicit memory optimization
         del metrics

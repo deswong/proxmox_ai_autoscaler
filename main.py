@@ -15,7 +15,7 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 
 def run():
-    logger.info("Starting Proxmox LXC Autoscaler Service...")
+    logger.info("Starting Proxmox Universal AI Autoscaler Service...")
     
     # Initialize SQLite database and baseline configurations
     storage.init_db()
@@ -39,11 +39,14 @@ def run():
         explicit_baselines = storage.get_baselines()
         from config import EXCLUDED_LXCS, MAX_HOST_CPU_ALLOCATION_PERCENT, MAX_HOST_RAM_ALLOCATION_PERCENT
         
-        # 3. Discover all running LXCs on the hypervisor
+        # 3. Discover all running LXCs and VMs on the hypervisor
         all_lxc_ids = px_client.get_all_lxc_ids()
+        all_vm_ids = px_client.get_all_vm_ids()
         
-        if not all_lxc_ids:
-            logger.warning("No LXCs found on this node. Nothing to monitor.")
+        from config import EXCLUDED_VMS
+        
+        if not all_lxc_ids and not all_vm_ids:
+            logger.warning("No LXCs or VMs found on this node. Nothing to monitor.")
         
         # 4. Evaluate each discovered LXC
         for lxc_id in all_lxc_ids:
@@ -83,10 +86,54 @@ def run():
                     logger.warning(f"[LXC {lxc_id}] Failed to log prediction for reinforcement learning: {db_err}")
                 
                 # Evaluate and emit scaling decisions
-                scaler.evaluate_and_scale(lxc_id, baseline, predicted_usage, current_metrics)
+                scaler.evaluate_and_scale(lxc_id, "LXC", baseline, predicted_usage, current_metrics)
                 
             except Exception as e:
                 logger.error(f"[LXC {lxc_id}] Exception during autoscaling cycle: {e}")
+                
+        # 5. Evaluate each discovered VM
+        for vm_id in all_vm_ids:
+            if vm_id in EXCLUDED_VMS:
+                logger.debug(f"[VM {vm_id}] Skipping (Listed in EXCLUDED_VMS blacklist).")
+                continue
+                
+            try:
+                # Fetch current telemetry from hypervisor
+                current_metrics = px_client.get_vm_metrics(vm_id)
+                if not current_metrics:
+                    logger.debug(f"[VM {vm_id}] Is not running or could not fetch metrics. Skipping.")
+                    continue
+                    
+                # Determine baseline: Use explicit if it exists, otherwise build a dynamic one
+                if vm_id in explicit_baselines:
+                    baseline = explicit_baselines[vm_id]
+                else:
+                    # Dynamic Zero-Config Baseline Setup
+                    baseline = {
+                        "min_cpus": 1,
+                        "min_ram_mb": 512,
+                        "max_cpus": current_metrics["allocated_cpus"] + 4,
+                        "max_ram_mb": current_metrics["allocated_ram_mb"] * 2
+                    }
+                    logger.debug(f"[VM {vm_id}] Using dynamic fallback baseline: {baseline}")
+                
+                # Retrieve recent RRD time-series graph directly from Proxmox
+                historical_metrics = px_client.get_vm_rrd_history(vm_id, timeframe="hour")
+                
+                # Predict impending usage
+                predicted_usage = predictor.predict_next_usage(vm_id, historical_metrics)
+                
+                # Record this prediction for the nightly XGBoost trainer to review and learn from
+                try:
+                    storage.log_prediction(vm_id, predicted_usage['cpu_percent'], predicted_usage['ram_usage_mb'])
+                except Exception as db_err:
+                    logger.warning(f"[VM {vm_id}] Failed to log prediction for reinforcement learning: {db_err}")
+                
+                # Evaluate and emit scaling decisions
+                scaler.evaluate_and_scale(vm_id, "VM", baseline, predicted_usage, current_metrics)
+                
+            except Exception as e:
+                logger.error(f"[VM {vm_id}] Exception during autoscaling cycle: {e}")
                 
         # Force garbage collection to keep daemon memory usage very low over time
         gc.collect()

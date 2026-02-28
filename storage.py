@@ -3,7 +3,9 @@ import json
 import time
 import logging
 from typing import Dict, List, Tuple
-from config import DATABASE_PATH, INITIAL_LXC_CONFIGS
+from config import DATABASE_PATH, INITIAL_LXC_CONFIGS, INITIAL_VM_CONFIGS
+
+INITIAL_CONFIGS = {**INITIAL_LXC_CONFIGS, **INITIAL_VM_CONFIGS}
 
 logger = logging.getLogger("storage")
 
@@ -62,7 +64,7 @@ def _seed_initial_baselines():
     current_time = time.time()
     
     # 1. Update or Insert configs from .env tracking
-    for lxc_id, config in INITIAL_LXC_CONFIGS.items():
+    for entity_id, config in INITIAL_CONFIGS.items():
         cursor.execute('''
             INSERT INTO lxc_baselines (lxc_id, min_cpus, min_ram_mb, max_cpus, max_ram_mb, updated_at)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -72,13 +74,13 @@ def _seed_initial_baselines():
                 max_cpus=excluded.max_cpus,
                 max_ram_mb=excluded.max_ram_mb,
                 updated_at=excluded.updated_at
-        ''', (str(lxc_id), config.get('min_cpus', 1), config.get('min_ram_mb', 512), 
+        ''', (str(entity_id), config.get('min_cpus', 1), config.get('min_ram_mb', 512), 
               config.get('max_cpus', 4), config.get('max_ram_mb', 4096), current_time))
               
     # 2. Prune any forgotten instances out of the local cache
-    if INITIAL_LXC_CONFIGS:
-        placeholders = ','.join(['?'] * len(INITIAL_LXC_CONFIGS))
-        cursor.execute(f"DELETE FROM lxc_baselines WHERE lxc_id NOT IN ({placeholders})", list(INITIAL_LXC_CONFIGS.keys()))
+    if INITIAL_CONFIGS:
+        placeholders = ','.join(['?'] * len(INITIAL_CONFIGS))
+        cursor.execute(f"DELETE FROM lxc_baselines WHERE lxc_id NOT IN ({placeholders})", list(INITIAL_CONFIGS.keys()))
     else:
         cursor.execute("DELETE FROM lxc_baselines")
     

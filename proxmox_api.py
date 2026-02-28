@@ -131,3 +131,78 @@ class ProxmoxClient:
         except Exception as e:
             logger.error(f"Failed to fetch list of LXCs from node {NODE_NAME}: {e}")
             return []
+
+    def get_vm_metrics(self, vm_id: str) -> dict:
+        """Fetches the current CPU and RAM metric usage for a specific VM."""
+        if not self.proxmox:
+            return None
+            
+        try:
+            status = self.node.qemu(vm_id).status.current.get()
+            
+            if status.get("status") != "running":
+                return None
+            
+            cpu = status.get("cpu", 0) * 100
+            
+            mem_bytes = status.get("mem", 0)
+            mem_mb = mem_bytes / (1024 * 1024)
+            
+            maxmem_bytes = status.get("maxmem", 0)
+            maxmem_mb = maxmem_bytes / (1024 * 1024)
+            cpus_allocated = status.get("cpus", 1)
+            
+            return {
+                "cpu_percent": float(cpu),
+                "ram_usage_mb": float(mem_mb),
+                "allocated_cpus": int(cpus_allocated),
+                "allocated_ram_mb": float(maxmem_mb)
+            }
+        except Exception as e:
+            logger.error(f"Failed to fetch metrics for VM {vm_id}: {e}")
+            return None
+
+    def update_vm_resources(self, vm_id: str, cpus: int, ram_mb: int):
+        """Updates the CPU cores and RAM allocation of a running VM."""
+        if not self.proxmox:
+            return False
+            
+        try:
+            # Requires Hotplug to be enabled in Proxmox VM Hardware configs
+            self.node.qemu(vm_id).config.put(
+                cores=int(cpus),
+                memory=int(ram_mb)
+            )
+            logger.info(f"[VM {vm_id}] Successfully hotplugged resources: {cpus} cores, {ram_mb} MB RAM")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to update resources for VM {vm_id}: {e}")
+            return False
+
+    def get_vm_rrd_history(self, vm_id: str, timeframe: str = 'hour') -> list:
+        """
+        Fetches the RRD historical graph data for a VM.
+        """
+        if not self.proxmox:
+            return []
+            
+        try:
+            rrd_data = self.node.qemu(vm_id).rrddata.get(timeframe=timeframe)
+            return rrd_data
+        except Exception as e:
+            logger.error(f"Failed to fetch RRD history for VM {vm_id}: {e}")
+            return []
+
+    def get_all_vm_ids(self) -> list:
+        """
+        Returns a list of all VM IDs currently existing on the target Proxmox node.
+        """
+        if not self.proxmox:
+            return []
+            
+        try:
+            vms = self.node.qemu.get()
+            return [str(vm['vmid']) for vm in vms]
+        except Exception as e:
+            logger.error(f"Failed to fetch list of VMs from node {NODE_NAME}: {e}")
+            return []

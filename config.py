@@ -16,7 +16,7 @@ console_handler.setFormatter(log_formatter)
 logger.addHandler(console_handler)
 
 # Attempt to configure Rotating File Handler for /var/log
-LOG_FILE_PATH = "/var/log/proxmox_lxc_autoscaler.log"
+LOG_FILE_PATH = "/var/log/proxmox_ai_autoscaler.log"
 try:
     file_handler = logging.handlers.RotatingFileHandler(
         LOG_FILE_PATH, maxBytes=5*1024*1024, backupCount=3
@@ -47,27 +47,36 @@ TRAINING_DAYS_LOOKBACK = int(os.getenv("TRAINING_DAYS_LOOKBACK", 7))
 
 # Initial Baselines
 INITIAL_LXC_CONFIGS = {}
+INITIAL_VM_CONFIGS = {}
+
 for key, value in os.environ.items():
-    if key.startswith("LXC_") and len(key) > 4:
+    if key.startswith("LXC_") or key.startswith("VM_"):
         try:
-            lxc_id = key.split("_")[1]
             parts = value.split(",")
             if len(parts) == 4:
-                INITIAL_LXC_CONFIGS[lxc_id] = {
+                prefix, entity_id = key.split("_", 1)
+                config_dict = {
                     "min_cpus": int(parts[0].strip()),
                     "min_ram_mb": int(parts[1].strip()),
                     "max_cpus": int(parts[2].strip()),
                     "max_ram_mb": int(parts[3].strip())
                 }
+                if prefix == "LXC":
+                    INITIAL_LXC_CONFIGS[entity_id] = config_dict
+                else:
+                    INITIAL_VM_CONFIGS[entity_id] = config_dict
             else:
                 logger.warning(f"Skipping {key}: Must have exactly 4 values (min_cpu, min_ram, max_cpu, max_ram)")
         except Exception as e:
             logger.error(f"Failed to parse environment variable {key}={value}. Error: {e}")
 
-# Excluded LXCs
-# Comma-separated list of LXC IDs to never autoscale
-_excluded_str = os.getenv("EXCLUDED_LXCS", "")
-EXCLUDED_LXCS = [x.strip() for x in _excluded_str.split(",") if x.strip()]
+# Excluded Containers and VMs
+# Comma-separated list of IDs to never autoscale
+_excluded_lxc_str = os.getenv("EXCLUDED_LXCS", "")
+EXCLUDED_LXCS = [x.strip() for x in _excluded_lxc_str.split(",") if x.strip()]
+
+_excluded_vm_str = os.getenv("EXCLUDED_VMS", "")
+EXCLUDED_VMS = [x.strip() for x in _excluded_vm_str.split(",") if x.strip()]
 
 DATABASE_PATH = os.getenv("DATABASE_PATH", "autoscaler.db")
 POLL_INTERVAL_SECONDS = 60

@@ -13,14 +13,14 @@ import storage
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - TRAINER - %(levelname)s - %(message)s')
 logger = logging.getLogger("train_models")
 
-def calculate_recent_penalties(lxc_id) -> dict:
+def calculate_recent_penalties(entity_id) -> dict:
     """
     Looks at the prediction_logs table to calculate the Mean Absolute Error (MAE)
     of the predictions made natively by the live service against actual historical data.
     """
     try:
         conn = sqlite3.connect(DATABASE_PATH)
-        df_preds = pd.read_sql_query("SELECT timestamp, predicted_cpu, predicted_ram FROM prediction_logs WHERE lxc_id=?", conn, params=(lxc_id,))
+        df_preds = pd.read_sql_query("SELECT timestamp, predicted_cpu, predicted_ram FROM prediction_logs WHERE lxc_id=?", conn, params=(entity_id,))
         conn.close()
         
         if df_preds.empty:
@@ -34,10 +34,10 @@ def calculate_recent_penalties(lxc_id) -> dict:
             "count": len(df_preds)
         }
     except Exception as e:
-        logger.error(f"Error reading reinforcement logs for {lxc_id}: {e}")
+        logger.error(f"Error reading reinforcement logs for {entity_id}: {e}")
         return {}
 
-def train_for_lxc(px_client, lxc_id, models_dir="./models"):
+def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
     """
     Pulls historical RRD data based on the configured lookback window,
     constructs the feature matrix, and trains an XGBoost model.
@@ -52,12 +52,16 @@ def train_for_lxc(px_client, lxc_id, models_dir="./models"):
     else:
         timeframe = "year"
         
-    logger.info(f"Fetching {TRAINING_DAYS_LOOKBACK} days of RRD data ({timeframe}) for LXC {lxc_id}...")
-    rrd_data = px_client.get_lxc_rrd_history(lxc_id, timeframe=timeframe)
+    logger.info(f"Fetching {TRAINING_DAYS_LOOKBACK} days of RRD data ({timeframe}) for {entity_type} {entity_id}...")
+    
+    if entity_type == "LXC":
+        rrd_data = px_client.get_lxc_rrd_history(entity_id, timeframe=timeframe)
+    else:
+        rrd_data = px_client.get_vm_rrd_history(entity_id, timeframe=timeframe)
     
     valid_metrics = [m for m in rrd_data if m.get('cpu') is not None and m.get('mem') is not None]
     if len(valid_metrics) < 100:
-        logger.warning(f"Not enough historical data to train LXC {lxc_id}. Needs at least 100 intervals.")
+        logger.warning(f"Not enough historical data to train {entity_type} {entity_id}. Needs at least 100 intervals.")
         return
         
     logger.info(f"Building supervised dataset from {len(valid_metrics)} data points...")
@@ -88,7 +92,7 @@ def train_for_lxc(px_client, lxc_id, models_dir="./models"):
     y_cpu = np.array(y_cpu)
     y_ram = np.array(y_ram)
     
-    logger.info(f"Training XGBoost Regressors for LXC {lxc_id}...")
+    logger.info(f"Training XGBoost Regressors for {entity_type} {entity_id}...")
     
     model_cpu = xgb.XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=5, objective='reg:squarederror')
     model_cpu.fit(X_matrix, y_cpu)
@@ -99,11 +103,12 @@ def train_for_lxc(px_client, lxc_id, models_dir="./models"):
     if not os.path.exists(models_dir):
         os.makedirs(models_dir)
         
-    model_cpu.save_model(os.path.join(models_dir, f"lxc_{lxc_id}_cpu.json"))
-    model_ram.save_model(os.path.join(models_dir, f"lxc_{lxc_id}_ram.json"))
+    prefix = entity_type.lower()
+    model_cpu.save_model(os.path.join(models_dir, f"{prefix}_{entity_id}_cpu.json"))
+    model_ram.save_model(os.path.join(models_dir, f"{prefix}_{entity_id}_ram.json"))
     
-    stats = calculate_recent_penalties(lxc_id)
-    logger.info(f"Successfully saved XGBoost models for LXC {lxc_id}. (Reinforcement entries processed: {stats.get('count', 0)})")
+    stats = calculate_recent_penalties(entity_id)
+    logger.info(f"Successfully saved XGBoost models for {entity_type} {entity_id}. (Reinforcement entries processed: {stats.get('count', 0)})")
 
 def run():
     logger.info("Starting Nightly XGBoost Batch Training Daemon...")
@@ -131,9 +136,26 @@ def run():
             continue
             
         try:
-            train_for_lxc(px_client, lxc_id)
+            train_for_entity(px_client, lxc_id, "LXC")
         except Exception as e:
             logger.error(f"Fatal error training LXC {lxc_id}: {e}")
+            
+    # 3. Discover all running VMs on the node
+    all_vm_ids = px_client.get_all_vm_ids()
+    from config import EXCLUDED_VMS
+    
+    if not all_vm_ids:
+        logger.warning("No VMs found on this node. Nothing to train.")
+    else:
+        for vm_id in all_vm_ids:
+            if vm_id in EXCLUDED_VMS:
+                logger.debug(f"Skipping training for VM {vm_id} (Listed in EXCLUDED_VMS).")
+                continue
+                
+            try:
+                train_for_entity(px_client, vm_id, "VM")
+            except Exception as e:
+                logger.error(f"Fatal error training VM {vm_id}: {e}")
             
     # Clean up old offline logs so the DB doesn't grow infinitely
     storage.cleanup_prediction_logs(retention_days=14)
