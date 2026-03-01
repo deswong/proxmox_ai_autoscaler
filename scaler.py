@@ -51,7 +51,7 @@ class Scaler:
         if predicted["cpu_percent"] > 85.0:
             desired_cpus += 1
         elif predicted["cpu_percent"] < 25.0 and current_metrics["cpu_percent"] < 25.0:
-            desired_cpus -= 1
+            desired_cpus = max(1, desired_cpus - 1)
 
         logger.info(
             f"[{entity_type} {entity_id}] Analyzing... Current State: "
