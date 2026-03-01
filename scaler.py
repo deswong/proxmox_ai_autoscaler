@@ -39,10 +39,12 @@ class Scaler:
         # CPU scaling heuristic:
         if predicted['cpu_percent'] > 85.0:
             desired_cpus += 1
-            logger.info(f"[{entity_type} {entity_id}] CPU usage predicting high ({predicted['cpu_percent']:.1f}%), scaling UP cores.")
+            if desired_cpus != current_metrics['allocated_cpus']:
+                logger.info(f"[{entity_type} {entity_id}] CPU usage predicting high ({predicted['cpu_percent']:.1f}%), scaling UP cores.")
         elif predicted['cpu_percent'] < 25.0 and current_metrics['cpu_percent'] < 25.0:
             desired_cpus -= 1
-            logger.info(f"[{entity_type} {entity_id}] CPU usage predicting low ({predicted['cpu_percent']:.1f}%), scaling DOWN cores.")
+            if desired_cpus != current_metrics['allocated_cpus']:
+                logger.info(f"[{entity_type} {entity_id}] CPU usage predicting low ({predicted['cpu_percent']:.1f}%), scaling DOWN cores.")
 
         # 2. Bound against configured baselines (min/max for this entity)
         target_ram = max(baseline['min_ram_mb'], min(int(desired_ram_mb), baseline['max_ram_mb']))
