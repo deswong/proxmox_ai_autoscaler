@@ -11,7 +11,8 @@ Zero database tuning, zero complex Prometheus stacks—just one service keeping 
 ## Features
 - **Proactive Scaling**: Looks up to 2 minutes into the future to predict impending spikes, allocating resources before they are needed.
 - **Batched Reinforcement Learning:** The underlying Machine Learning engine trains offline automatically every night, meaning the live scaling engine uses zero RAM and CPU on your Proxmox host.
-- **Boot Storm Protection:** Automatically enforces a 15-minute grace period on recently restarted VMs and LXCs to prevent the AI from learning from artificial startup CPU spikes.
+- **Initial Allocation Baselining**: Automatically records your original CPU and RAM configuration to the Proxmox UI Notes before making any automated adjustments.
+- **Boot Storm Protection**: Automatically enforces a 15-minute grace period on recently restarted VMs and LXCs to prevent the AI from learning from artificial startup CPU spikes.
 - **Native Proxmox Integration**: Uses Proxmox's internal `rrddata` graph APIs to pull usage metrics without needing custom local telemetry agents or guest-agents.
 - **Universal Hotplugging**: Dynamically adjusts CPU cores and Memory allocation on-the-fly without restarting the VMs or containers.
   - *Note: For VMs, you MUST explicitly enable "Hotplug: Memory, CPU" in the Proxmox UI under the VM Hardware settings.*
@@ -28,7 +29,7 @@ Proxmox allows you to allocate more CPU cores and RAM to containers than you phy
 To prevent this, the autoscaler implements a **Hard 95.0% Emergency Stop**. During every single 60-second cycle, the daemon asks the Proxmox Node for its *true physical utilization*. If your server is currently using >95.0% of its physical RAM or CPU, the AI is mathematically forbidden from scaling any instance *upward*, no matter how badly it needs it. It will continue to scale instances *downward* to free up resources, eventually relieving the node. You can control this threshold in the `.env` via `MAX_HOST_CPU_ALLOCATION_PERCENT`.
 
 ### 3. Zero-Config Discovery
-You do not need to tell the autoscaler which instances to manage. By default, it queries the Proxmox API for every running VM and LXC on the node.
+You do not need to tell the autoscaler which instances to manage. By default, it queries the Proxmox API for every VM and LXC on the node, regardless of whether they are currently powered on or off.
 
 If it finds an instance that is not strictly defined in your `.env` file, it assigns it a **Dynamic Baseline**:
 - **Min CPU:** 1
@@ -92,7 +93,7 @@ Once configured, tell systemd to start the autoscaler:
 systemctl start proxmox-ai-autoscaler
 ```
 
-You can watch the AI actively scaling your instances by observing the universal log file:
+You can watch the AI actively predicting and explicitly scaling your instances (e.g., `UP to 4 Cores`) by observing the universal log file:
 ```bash
 tail -f /var/log/proxmox_ai_autoscaler.log
 ```
