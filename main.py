@@ -29,6 +29,15 @@ def run():
     predictor = Predictor(prediction_horizon=2)  # Predict 2 cycles (minutes) ahead
     scaler = Scaler(px_client)
 
+    # Warn if poll interval is below Proxmox's RRD resolution (1-minute granularity).
+    # Polling faster than 60s wastes API calls since no new RRD data will be available yet.
+    if POLL_INTERVAL_SECONDS < 60:
+        logger.warning(
+            f"POLL_INTERVAL_SECONDS is set to {POLL_INTERVAL_SECONDS}s, which is below Proxmox's "
+            f"RRD resolution of 60s. Predictions will repeat the same data until a new data point "
+            f"arrives. Consider setting POLL_INTERVAL_SECONDS=60 or higher."
+        )
+
     # Main run loop
     while True:
         cycle_start_time = time.time()
