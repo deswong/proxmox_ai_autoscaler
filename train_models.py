@@ -60,8 +60,8 @@ def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
         rrd_data = px_client.get_vm_rrd_history(entity_id, timeframe=timeframe)
     
     valid_metrics = [m for m in rrd_data if m.get('cpu') is not None and m.get('mem') is not None]
-    if len(valid_metrics) < 100:
-        logger.warning(f"Not enough historical data to train {entity_type} {entity_id}. Needs at least 100 intervals.")
+    if len(valid_metrics) < 30:
+        logger.warning(f"Not enough historical data to train {entity_type} {entity_id}. Needs at least 30 intervals.")
         return
         
     logger.info(f"Building supervised dataset from {len(valid_metrics)} data points...")
@@ -124,7 +124,7 @@ def run():
     from config import EXCLUDED_LXCS
     
     # 2. Discover all running LXCs on the node
-    all_lxc_ids = px_client.get_all_lxc_ids()
+    all_lxc_ids = list(px_client.get_all_lxc_metrics().keys())
     
     if not all_lxc_ids:
         logger.warning("No LXCs found on this node. Nothing to train.")
@@ -141,7 +141,7 @@ def run():
             logger.error(f"Fatal error training LXC {lxc_id}: {e}")
             
     # 3. Discover all running VMs on the node
-    all_vm_ids = px_client.get_all_vm_ids()
+    all_vm_ids = list(px_client.get_all_vm_metrics().keys())
     from config import EXCLUDED_VMS
     
     if not all_vm_ids:
