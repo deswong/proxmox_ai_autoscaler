@@ -39,23 +39,27 @@ class Scaler:
         # CPU scaling heuristic:
         if predicted['cpu_percent'] > 85.0:
             desired_cpus += 1
-            if desired_cpus != current_metrics['allocated_cpus']:
-                logger.info(f"[{entity_type} {entity_id}] CPU usage predicting high ({predicted['cpu_percent']:.1f}%), scaling UP cores.")
         elif predicted['cpu_percent'] < 25.0 and current_metrics['cpu_percent'] < 25.0:
             desired_cpus -= 1
-            if desired_cpus != current_metrics['allocated_cpus']:
-                logger.info(f"[{entity_type} {entity_id}] CPU usage predicting low ({predicted['cpu_percent']:.1f}%), scaling DOWN cores.")
 
         # 2. Bound against configured baselines (min/max for this entity)
         target_ram = max(baseline['min_ram_mb'], min(int(desired_ram_mb), baseline['max_ram_mb']))
         target_cpus = max(baseline['min_cpus'], min(desired_cpus, baseline['max_cpus']))
         
+        # Log CPU changes only if they pass baseline bounds
+        if target_cpus > current_metrics['allocated_cpus']:
+            logger.info(f"[{entity_type} {entity_id}] CPU usage predicting high ({predicted['cpu_percent']:.1f}%), scaling UP cores.")
+        elif target_cpus < current_metrics['allocated_cpus']:
+            logger.info(f"[{entity_type} {entity_id}] CPU usage predicting low ({predicted['cpu_percent']:.1f}%), scaling DOWN cores.")
+        
         # Proxmox hotplug mechanism requires at least 1024 MB for VMs, and hot-unplug is generally unreliable
         if entity_type == "VM":
             if target_ram < 1024:
-                logger.info(f"[{entity_type} {entity_id}] Enforcing Proxmox VM hotplug minimum of 1024 MB RAM.")
+                if target_ram != current_metrics['allocated_ram_mb'] and current_metrics['allocated_ram_mb'] >= 1024:
+                    logger.info(f"[{entity_type} {entity_id}] Enforcing Proxmox VM hotplug minimum of 1024 MB RAM.")
                 target_ram = 1024
             if target_ram < current_metrics['allocated_ram_mb']:
+                # The prediction wanted to scale down RAM, but we block it
                 logger.info(f"[{entity_type} {entity_id}] VM Memory hot-unplug is unreliable. Preventing RAM scale-down.")
                 target_ram = current_metrics['allocated_ram_mb']
 
