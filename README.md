@@ -59,7 +59,7 @@ To allow the autoscaler to magically adjust your hardware, you need to create a 
 Run the automated one-liner script. This securely clones the repository to the standard `/opt/proxmox-ai-autoscaler` directory, safely configures the Python Machine Learning environment, registers the daemon, and provisions your nightly XGBoost automated-training chron-jobs implicitly.
 
 ```bash
-curl -sL https://raw.githubusercontent.com/deswong/proxmox_ai_autoscaler/main/install.sh | sudo bash
+curl -sL https://raw.githubusercontent.com/deswong/proxmox_ai_autoscaler/main/install.sh | bash
 ```
 
 ---
