@@ -57,18 +57,25 @@ class ProxmoxClient:
         if not self.proxmox:
             return False
             
-        try:
-            # We hotplug the CPU and Memory via the API.
-            # Proxmox config API expects memory in MB
-            self.node.lxc(lxc_id).config.put(
-                cores=int(cpus),
-                memory=int(ram_mb)
-            )
-            logger.info(f"[LXC {lxc_id}] Successfully hotplugged resources: {cpus} cores, {ram_mb} MB RAM")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to update resources for LXC {lxc_id}: {e}")
-            return False
+        import time
+        max_retries = 3
+        
+        for attempt in range(max_retries):
+            try:
+                # We hotplug the CPU and Memory via the API.
+                # Proxmox config API expects memory in MB
+                self.node.lxc(lxc_id).config.put(
+                    cores=int(cpus),
+                    memory=int(ram_mb)
+                )
+                logger.info(f"[LXC {lxc_id}] Successfully hotplugged resources: {cpus} cores, {ram_mb} MB RAM")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to update resources for LXC {lxc_id} (Attempt {attempt+1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                else:
+                    return False
 
     def get_lxc_rrd_history(self, lxc_id: str, timeframe: str = 'hour') -> list:
         """
@@ -119,17 +126,24 @@ class ProxmoxClient:
         if not self.proxmox:
             return False
             
-        try:
-            # Requires Hotplug to be enabled in Proxmox VM Hardware configs
-            self.node.qemu(vm_id).config.put(
-                cores=int(cpus),
-                memory=int(ram_mb)
-            )
-            logger.info(f"[VM {vm_id}] Successfully hotplugged resources: {cpus} cores, {ram_mb} MB RAM")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to update resources for VM {vm_id}: {e}")
-            return False
+        import time
+        max_retries = 3
+        
+        for attempt in range(max_retries):
+            try:
+                # Requires Hotplug to be enabled in Proxmox VM Hardware configs
+                self.node.qemu(vm_id).config.put(
+                    cores=int(cpus),
+                    memory=int(ram_mb)
+                )
+                logger.info(f"[VM {vm_id}] Successfully hotplugged resources: {cpus} cores, {ram_mb} MB RAM")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to update resources for VM {vm_id} (Attempt {attempt+1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                else:
+                    return False
 
     def get_vm_rrd_history(self, vm_id: str, timeframe: str = 'hour') -> list:
         """
