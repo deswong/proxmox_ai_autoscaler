@@ -115,7 +115,8 @@ class ProxmoxClient:
                     "cpu_percent": float(lxc.get("cpu", 0) * 100),
                     "ram_usage_mb": float(lxc.get("mem", 0) / (1024 * 1024)),
                     "allocated_cpus": int(lxc.get("cpus", 1)),
-                    "allocated_ram_mb": float(lxc.get("maxmem", 0) / (1024 * 1024))
+                    "allocated_ram_mb": float(lxc.get("maxmem", 0) / (1024 * 1024)),
+                    "uptime": int(lxc.get("uptime", 0))
                 }
             return metrics_dict
         except Exception as e:
@@ -179,7 +180,8 @@ class ProxmoxClient:
                     "cpu_percent": float(vm.get("cpu", 0) * 100),
                     "ram_usage_mb": float(vm.get("mem", 0) / (1024 * 1024)),
                     "allocated_cpus": int(vm.get("cpus", 1)),
-                    "allocated_ram_mb": float(vm.get("maxmem", 0) / (1024 * 1024))
+                    "allocated_ram_mb": float(vm.get("maxmem", 0) / (1024 * 1024)),
+                    "uptime": int(vm.get("uptime", 0))
                 }
             return metrics_dict
         except Exception as e:

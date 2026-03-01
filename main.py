@@ -54,6 +54,11 @@ def run():
                 logger.debug(f"[LXC {lxc_id}] Skipping (Listed in EXCLUDED_LXCS blacklist).")
                 continue
                 
+            # Skip recently booted entities (under 15 minutes) to prevent learning from boot storms
+            if current_metrics.get("uptime", 0) < 900:
+                logger.info(f"[LXC {lxc_id}] Skipping scaling. Entity just booted (Uptime: {current_metrics.get('uptime', 0)}s < 900s).")
+                continue
+                
             try:
                 # current_metrics is already bulk-fetched from RAM
                     
@@ -91,6 +96,11 @@ def run():
         for vm_id, current_metrics in all_vm_metrics.items():
             if vm_id in EXCLUDED_VMS:
                 logger.debug(f"[VM {vm_id}] Skipping (Listed in EXCLUDED_VMS blacklist).")
+                continue
+                
+            # Skip recently booted entities (under 15 minutes) to prevent learning from boot storms
+            if current_metrics.get("uptime", 0) < 900:
+                logger.info(f"[VM {vm_id}] Skipping scaling. Entity just booted (Uptime: {current_metrics.get('uptime', 0)}s < 900s).")
                 continue
                 
             try:
