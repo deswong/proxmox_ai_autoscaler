@@ -78,7 +78,10 @@ def run():
                 historical_metrics = px_client.get_lxc_rrd_history(lxc_id, timeframe="hour")
                 
                 # Predict impending usage
-                predicted_usage = predictor.predict_next_usage(lxc_id, historical_metrics)
+                predicted_usage = predictor.predict_next_usage(lxc_id, historical_metrics, entity_type="LXC")
+                
+                if predicted_usage is None:
+                    continue
                 
                 # Record this prediction for the nightly XGBoost trainer to review and learn from
                 try:
@@ -123,7 +126,10 @@ def run():
                 historical_metrics = px_client.get_vm_rrd_history(vm_id, timeframe="hour")
                 
                 # Predict impending usage
-                predicted_usage = predictor.predict_next_usage(vm_id, historical_metrics)
+                predicted_usage = predictor.predict_next_usage(vm_id, historical_metrics, entity_type="VM")
+                
+                if predicted_usage is None:
+                    continue
                 
                 # Record this prediction for the nightly XGBoost trainer to review and learn from
                 try:

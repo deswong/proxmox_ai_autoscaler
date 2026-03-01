@@ -60,7 +60,8 @@ class Predictor:
         valid_metrics = [m for m in rrd_data if m.get('cpu') is not None and m.get('mem') is not None]
         
         if not valid_metrics:
-            return {"cpu_percent": 0.0, "ram_usage_mb": 0.0, "recent_peak_cpu": 0.0, "recent_peak_ram": 0.0}
+            logger.warning(f"No valid telemetry data received for {entity_type} {entity_id}. Aborting prediction to prevent dangerous scale-down.")
+            return None
             
         # We want the most recent 15 valid data points for a smooth, fast trend
         metrics = valid_metrics[-15:]
