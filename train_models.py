@@ -4,7 +4,7 @@ import sqlite3
 import pandas as pd
 import numpy as np
 import xgboost as xgb
-from config import DATABASE_PATH
+from config import DATABASE_PATH, EXCLUDED_LXCS, EXCLUDED_VMS, TRAINING_DAYS_LOOKBACK
 from proxmox_api import ProxmoxClient
 import storage
 
@@ -49,8 +49,6 @@ def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
     Pulls historical RRD data based on the configured lookback window,
     constructs the feature matrix, and trains an XGBoost model.
     """
-    from config import TRAINING_DAYS_LOOKBACK
-
     # Proxmox API only accepts specific timeframe strings.
     if TRAINING_DAYS_LOOKBACK <= 7:
         timeframe = "week"
@@ -105,17 +103,25 @@ def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
     y_cpu = np.array(y_cpu)
     y_ram = np.array(y_ram)
 
+    # Time-based sample weights: more recent samples are given exponentially higher weight
+    # so the model prioritises current usage patterns over old historical data.
+    n_samples = len(X_matrix)
+    sample_weights = np.exp(
+        np.linspace(0, 3, n_samples)
+    )  # weight range: e^0=1.0 to e^3=~20
+    sample_weights /= sample_weights.sum()  # normalise so weights sum to 1
+
     logger.info(f"Training XGBoost Regressors for {entity_type} {entity_id}...")
 
     model_cpu = xgb.XGBRegressor(
         n_estimators=100, learning_rate=0.1, max_depth=5, objective="reg:squarederror"
     )
-    model_cpu.fit(X_matrix, y_cpu)
+    model_cpu.fit(X_matrix, y_cpu, sample_weight=sample_weights)
 
     model_ram = xgb.XGBRegressor(
         n_estimators=100, learning_rate=0.1, max_depth=5, objective="reg:squarederror"
     )
-    model_ram.fit(X_matrix, y_ram)
+    model_ram.fit(X_matrix, y_ram, sample_weight=sample_weights)
 
     if not os.path.exists(models_dir):
         os.makedirs(models_dir)
@@ -139,8 +145,6 @@ def run():
 
     storage.init_db()
 
-    from config import EXCLUDED_LXCS
-
     # 2. Discover all LXCs on the node
     all_lxc_ids = px_client.get_all_lxc_ids()
 
@@ -162,7 +166,6 @@ def run():
 
     # 3. Discover all VMs on the node
     all_vm_ids = px_client.get_all_vm_ids()
-    from config import EXCLUDED_VMS
 
     if not all_vm_ids:
         logger.warning("No VMs found on this node. Nothing to train.")

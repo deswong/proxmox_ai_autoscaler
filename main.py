@@ -1,6 +1,6 @@
 import time
 import logging
-from config import POLL_INTERVAL_SECONDS
+from config import POLL_INTERVAL_SECONDS, EXCLUDED_LXCS, EXCLUDED_VMS
 import storage
 from proxmox_api import ProxmoxClient
 from predictor import Predictor
@@ -37,13 +37,10 @@ def run():
 
         # 2. Re-fetch explicit baselines (from .env/DB) and excluded lists
         explicit_baselines = storage.get_baselines()
-        from config import EXCLUDED_LXCS
 
         # 3. Bulk fetch telemetry for all running LXCs and VMs
         all_lxc_metrics = px_client.get_all_lxc_metrics()
         all_vm_metrics = px_client.get_all_vm_metrics()
-
-        from config import EXCLUDED_VMS
 
         if not all_lxc_metrics and not all_vm_metrics:
             logger.warning(
@@ -97,7 +94,7 @@ def run():
                     logger.debug(
                         f"[LXC {lxc_id}] Using dynamic fallback baseline: {baseline}"
                     )
-                # Retrieve recent RRD time-series graph directly from Proxmox
+                # Retrieve recent RRD time-series (last hour is sufficient; we only use 15 points)
                 historical_metrics = px_client.get_lxc_rrd_history(
                     lxc_id, timeframe="hour"
                 )
@@ -178,7 +175,7 @@ def run():
                         f"[VM {vm_id}] Using dynamic fallback baseline: {baseline}"
                     )
 
-                # Retrieve recent RRD time-series graph directly from Proxmox
+                # Retrieve recent RRD time-series (last hour is sufficient; we only use 15 points)
                 historical_metrics = px_client.get_vm_rrd_history(
                     vm_id, timeframe="hour"
                 )

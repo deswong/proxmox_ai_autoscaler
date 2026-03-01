@@ -1,4 +1,5 @@
 import logging
+import time
 from proxmoxer import ProxmoxAPI
 import urllib3
 from config import (
@@ -63,8 +64,6 @@ class ProxmoxClient:
         """Updates the CPU cores and RAM allocation of a running LXC."""
         if not self.proxmox:
             return False
-
-        import time
 
         max_retries = 3
 
@@ -186,8 +185,6 @@ class ProxmoxClient:
         """Updates the CPU cores and RAM allocation of a running VM."""
         if not self.proxmox:
             return False
-
-        import time
 
         max_retries = 3
 

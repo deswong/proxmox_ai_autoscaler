@@ -39,18 +39,18 @@ class Scaler:
             1 + self.ram_buffer_percent / 100.0
         )
 
-        # CPU predictor returns a percent (0-100+) of currently allocated cores based on recent telemetry.
-        # This is trickier depending on how Proxmox reports CPU over multiple cores.
-        # For simplicity, if predicted cpu percent > 80, we want another core.
-        # If predicted cpu percent < 30, we can drop a core.
-        # It's safer to base CPU scaling up on the current metrics + predicted trend rather than an exact math conversion here.
+        # CPU scaling heuristic - proportional to the predicted load:
+        # Scale UP: add 1 core for every 15% above the 85% high-water mark
+        # Scale DOWN: drop 1 core for every 30% below the 25% low-water mark
         desired_cpus = current_metrics["allocated_cpus"]
-
-        # CPU scaling heuristic:
         if predicted["cpu_percent"] > 85.0:
-            desired_cpus += 1
+            overshoot = predicted["cpu_percent"] - 85.0
+            cores_to_add = max(1, int(overshoot / 15))
+            desired_cpus += cores_to_add
         elif predicted["cpu_percent"] < 25.0 and current_metrics["cpu_percent"] < 25.0:
-            desired_cpus = max(1, desired_cpus - 1)
+            undershoot = 25.0 - predicted["cpu_percent"]
+            cores_to_remove = max(1, int(undershoot / 30))
+            desired_cpus = max(1, desired_cpus - cores_to_remove)
 
         logger.info(
             f"[{entity_type} {entity_id}] Analyzing... Current State: "
