@@ -481,6 +481,45 @@ def test_scaler_swap_cap_corrected_without_ram_change():
         f"Swap cap should be at least LXC_MIN_SWAP_MB=256, got {px.last_update['swap_mb']}"
     )
 
+def test_scaler_host_swap_safety_cap():
+    """Scaler must refuse to scale UP CPU or RAM when host swap usage exceeds MAX_HOST_SWAP_USAGE_PERCENT."""
+    from scaler import Scaler
+    import config as cfg
+
+    original_cap = cfg.MAX_HOST_SWAP_USAGE_PERCENT
+    cfg.MAX_HOST_SWAP_USAGE_PERCENT = 20.0
+
+    class MockProxmoxClient:
+        def __init__(self):
+            self.last_update = None
+
+        def get_host_usage(self):
+            # Host CPU and RAM are fine, but swap is at 25% (over 20% limit)
+            return {"cpu_percent": 50.0, "ram_percent": 50.0, "swap_percent": 25.0, "total_ram_mb": 64000}
+
+        def update_lxc_resources(self, _lxc_id, cpus, ram_mb, swap_mb=0):
+            self.last_update = {"cpus": cpus, "ram_mb": ram_mb, "swap_mb": swap_mb}
+
+    px = MockProxmoxClient()
+    scaler = Scaler(px)
+
+    baseline = {"min_cpus": 1, "max_cpus": 4, "min_ram_mb": 1024.0, "max_ram_mb": 8192.0}
+    predicted = {"cpu_percent": 90.0, "ram_usage_mb": 3000.0}
+    current_metrics = {"allocated_cpus": 1, "allocated_ram_mb": 1024.0, "cpu_percent": 60.0}
+
+    scaler.evaluate_and_scale("300", "LXC", baseline, predicted, current_metrics)
+
+    cfg.MAX_HOST_SWAP_USAGE_PERCENT = original_cap
+
+    print("\nTesting Host Swap Safety Cap (Host 25% Swap > 20% Limit):")
+    print(f"Update Requested: {px.last_update}")
+
+    # Scale UP should be blocked, keeping variables at current baseline (1 cpu, 1024 RAM)
+    # The scaler still calls the API because swap auto-provisioning asks for LXC_MIN_SWAP_MB
+    assert px.last_update is not None
+    assert px.last_update["cpus"] == 1, "CPU scale-up must be blocked by host swap cap"
+    assert px.last_update["ram_mb"] == 1024.0, "RAM scale-up must be blocked by host swap cap"
+
 
 if __name__ == "__main__":
     print("Running Mock AI Predictor Tests...")
@@ -493,4 +532,5 @@ if __name__ == "__main__":
     test_scaler_dynamic_swap_sizing()
     test_scaler_safe_flush_guard()
     test_scaler_swap_cap_corrected_without_ram_change()
+    test_scaler_host_swap_safety_cap()
     print("All mock tests passed!")

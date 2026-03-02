@@ -49,6 +49,9 @@ MAX_HOST_CPU_ALLOCATION_PERCENT = min(
 MAX_HOST_RAM_ALLOCATION_PERCENT = min(
     float(os.getenv("MAX_HOST_RAM_ALLOCATION_PERCENT", 85.0)), 95.0
 )
+MAX_HOST_SWAP_USAGE_PERCENT = min(
+    float(os.getenv("MAX_HOST_SWAP_USAGE_PERCENT", 20.0)), 95.0
+)
 
 # Swap cap applied to every managed LXC on each resource update.
 # -1 = auto (ML-driven dynamic sizing per container, recommended default)

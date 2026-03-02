@@ -51,9 +51,15 @@ class ProxmoxClient:
             # cpu
             cpu_percent = status.get("cpu", 0) * 100
 
+            # swap
+            swap_total = status.get("swap", {}).get("total", 0)
+            swap_used = status.get("swap", {}).get("used", 0)
+            swap_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+
             return {
                 "cpu_percent": float(cpu_percent),
                 "ram_percent": float(ram_percent),
+                "swap_percent": float(swap_percent),
                 "total_ram_mb": mem_total / (1024 * 1024),
             }
         except Exception as e:

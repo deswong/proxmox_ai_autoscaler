@@ -2,6 +2,7 @@ import logging
 from config import (
     MAX_HOST_CPU_ALLOCATION_PERCENT,
     MAX_HOST_RAM_ALLOCATION_PERCENT,
+    MAX_HOST_SWAP_USAGE_PERCENT,
     LXC_TARGET_SWAP_MB,
     LXC_MIN_SWAP_MB,
     SWAP_FLUSH_THRESHOLD_PERCENT,
@@ -106,6 +107,22 @@ class Scaler:
         # Hardcoded emergency safeguard (caps user config at max 95%)
         safe_cpu_limit = min(MAX_HOST_CPU_ALLOCATION_PERCENT, 95.0)
         safe_ram_limit = min(MAX_HOST_RAM_ALLOCATION_PERCENT, 95.0)
+        safe_swap_limit = min(MAX_HOST_SWAP_USAGE_PERCENT, 95.0)
+
+        # Apply Host Swap Safety Cap
+        # If the host is heavily swapping, completely block all scale-ups to prevent
+        # exacerbating an already memory-starved hypervisor.
+        if (
+            host_metrics.get("swap_percent", 0.0) > safe_swap_limit
+            and (target_cpus > current_metrics["allocated_cpus"] or target_ram > current_metrics["allocated_ram_mb"])
+        ):
+            logger.warning(
+                f"[{entity_type} {entity_id}] SAFETY CAP: Cannot scale up. Host Node Swap is over "
+                f"threshold ({host_metrics['swap_percent']:.1f}% > {safe_swap_limit}%)."
+            )
+            # Limit scale up to current allocation for both
+            target_cpus = min(target_cpus, current_metrics["allocated_cpus"])
+            target_ram = min(target_ram, current_metrics["allocated_ram_mb"])
 
         if (
             host_metrics["cpu_percent"] > safe_cpu_limit
