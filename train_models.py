@@ -67,7 +67,9 @@ def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
         rrd_data = px_client.get_vm_rrd_history(entity_id, timeframe=timeframe)
 
     valid_metrics = [
-        m for m in rrd_data if m.get("cpu") is not None and m.get("mem") is not None
+        m
+        for m in rrd_data
+        if m.get("cpu") is not None and m.get("mem") is not None
     ]
     if len(valid_metrics) < 30:
         logger.warning(
@@ -80,6 +82,7 @@ def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
     X_matrix = []
     y_cpu = []
     y_ram = []
+    y_swap = []  # LXC only; stays empty for VMs
 
     # We need 15 past data points to predict 2 points into the future
     PREDICTION_HORIZON = 2
@@ -98,10 +101,13 @@ def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
         X_matrix.append(features)
         y_cpu.append(target.get("cpu", 0.0) * 100)
         y_ram.append(target.get("mem", 0.0) / (1024 * 1024))
+        # Proxmox RRD returns swap in bytes for LXCs; default to 0 if absent
+        y_swap.append(target.get("swap", 0.0) / (1024 * 1024))
 
     X_matrix = np.array(X_matrix)
     y_cpu = np.array(y_cpu)
     y_ram = np.array(y_ram)
+    y_swap = np.array(y_swap)
 
     # Time-based sample weights: more recent samples are given exponentially higher weight
     # so the model prioritises current usage patterns over old historical data.
@@ -129,6 +135,25 @@ def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
     prefix = entity_type.lower()
     model_cpu.save_model(os.path.join(models_dir, f"{prefix}_{entity_id}_cpu.json"))
     model_ram.save_model(os.path.join(models_dir, f"{prefix}_{entity_id}_ram.json"))
+
+    # Swap predictor is LXC-only (VMs manage swap inside the guest OS)
+    if entity_type == "LXC" and y_swap.sum() > 0:
+        model_swap = xgb.XGBRegressor(
+            n_estimators=100, learning_rate=0.1, max_depth=5, objective="reg:squarederror"
+        )
+        model_swap.fit(X_matrix, y_swap, sample_weight=sample_weights)
+        model_swap.save_model(
+            os.path.join(models_dir, f"{prefix}_{entity_id}_swap.json")
+        )
+        logger.info(
+            f"[LXC {entity_id}] Swap predictor trained "
+            f"(peak observed: {y_swap.max():.0f} MB)."
+        )
+    elif entity_type == "LXC":
+        logger.info(
+            f"[LXC {entity_id}] No swap usage in training window — "
+            "skipping swap model (will use LXC_MIN_SWAP_MB floor)."
+        )
 
     stats = calculate_recent_penalties(entity_id)
     logger.info(

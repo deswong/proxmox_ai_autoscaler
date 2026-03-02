@@ -285,10 +285,127 @@ def test_scaler_swap_flush_triggered():
     print(f"Flush Called: {px.flush_called}")
 
     assert px.last_update is not None, "Scaler should have issued a resource update"
-    assert px.last_update["swap_mb"] == 0, (
-        f"Scaler should set swap_mb=0, got {px.last_update['swap_mb']}"
+    assert px.last_update["swap_mb"] >= 256, (
+        f"Scaler should set swap_mb to at least LXC_MIN_SWAP_MB (256), "
+        f"got {px.last_update['swap_mb']}"
     )
     assert px.flush_called, "Scaler should have called flush_lxc_swap on swap saturation"
+
+
+def test_scaler_dynamic_swap_sizing():
+    """In auto mode (LXC_TARGET_SWAP_MB=-1) the scaler must size swap from the
+    observed peak with a 30% buffer, floored at LXC_MIN_SWAP_MB."""
+    from scaler import Scaler
+    import config as cfg
+
+    original_target = cfg.LXC_TARGET_SWAP_MB
+    original_min = cfg.LXC_MIN_SWAP_MB
+    cfg.LXC_TARGET_SWAP_MB = -1    # auto mode
+    cfg.LXC_MIN_SWAP_MB = 256
+
+    class MockProxmoxClient:
+        def __init__(self):
+            self.last_update = None
+            self.flush_called = False
+
+        def get_host_usage(self):
+            return {"cpu_percent": 10.0, "ram_percent": 20.0, "total_ram_mb": 64000}
+
+        def update_lxc_resources(self, _lxc_id, cpus, ram_mb, swap_mb=0):
+            self.last_update = {"cpus": cpus, "ram_mb": ram_mb, "swap_mb": swap_mb}
+
+        def flush_lxc_swap(self, _lxc_id):
+            self.flush_called = True
+            return True
+
+    px = MockProxmoxClient()
+    scaler = Scaler(px)
+
+    # peak_swap = max(200, 300) = 300; desired = 300 * 1.30 = 390; floor=256 -> 390
+    baseline = {"min_cpus": 2, "max_cpus": 2, "min_ram_mb": 2048.0, "max_ram_mb": 4096.0}
+    predicted = {
+        "cpu_percent": 10.0,
+        "ram_usage_mb": 1500.0,
+        "recent_peak_cpu": 12.0,
+        "recent_peak_ram": 1600.0,
+        "predicted_swap_mb": 200.0,
+        "recent_peak_swap": 300.0,
+    }
+    current_metrics = {
+        "allocated_cpus": 2,
+        "allocated_ram_mb": 2048.0,
+        "ram_usage_mb": 1400.0,
+        "cpu_percent": 10.0,
+        "swap_mb": 0.0,
+        "allocated_swap_mb": 256.0,
+    }
+
+    scaler.evaluate_and_scale("204", "LXC", baseline, predicted, current_metrics)
+    cfg.LXC_TARGET_SWAP_MB = original_target
+    cfg.LXC_MIN_SWAP_MB = original_min
+
+    print("\nTesting Dynamic Swap Sizing (peak=300 MB, expect ~390 MB):")
+    print(f"Update Requested: {px.last_update}")
+
+    assert px.last_update is not None, "Scaler should have issued an update"
+    assert px.last_update["swap_mb"] >= 380, (
+        f"Expected swap ~390 MB (300*1.30), got {px.last_update['swap_mb']}"
+    )
+
+
+def test_scaler_safe_flush_guard():
+    """The scaler must NOT flush swap when RAM headroom < swap_used * 1.1,
+    even when swap saturation is detected."""
+    from scaler import Scaler
+
+    class MockProxmoxClient:
+        def __init__(self):
+            self.last_update = None
+            self.flush_called = False
+
+        def get_host_usage(self):
+            return {"cpu_percent": 10.0, "ram_percent": 50.0, "total_ram_mb": 64000}
+
+        def update_lxc_resources(self, _lxc_id, cpus, ram_mb, swap_mb=0):
+            self.last_update = {"cpus": cpus, "ram_mb": ram_mb, "swap_mb": swap_mb}
+
+        def flush_lxc_swap(self, _lxc_id):
+            self.flush_called = True
+            return True
+
+    px = MockProxmoxClient()
+    scaler = Scaler(px)
+
+    # target_ram is clamped at max_ram_mb=2048; ram_usage_mb=1910 -> headroom=138 MB
+    # swap_used=400 MB -> needs 400*1.1=440 MB headroom -> 138 < 440 -> flush blocked
+    baseline = {"min_cpus": 2, "max_cpus": 2, "min_ram_mb": 2048.0, "max_ram_mb": 2048.0}
+    predicted = {
+        "cpu_percent": 10.0,
+        "ram_usage_mb": 1800.0,
+        "recent_peak_cpu": 12.0,
+        "recent_peak_ram": 1900.0,
+        "predicted_swap_mb": 400.0,
+        "recent_peak_swap": 400.0,
+    }
+    current_metrics = {
+        "allocated_cpus": 2,
+        "allocated_ram_mb": 2048.0,
+        "ram_usage_mb": 1910.0,
+        "cpu_percent": 10.0,
+        "swap_mb": 400.0,
+        "allocated_swap_mb": 512.0,  # 400/512 = 78% > 50% threshold -> flush desired
+    }
+
+    scaler.evaluate_and_scale("205", "LXC", baseline, predicted, current_metrics)
+
+    print("\nTesting Safe Flush Guard (headroom 148 MB < swap 400*1.1=440 MB):")
+    print(f"Update Requested: {px.last_update}")
+    print(f"Flush Called: {px.flush_called}")
+
+    assert px.last_update is not None, "Scaler should still issue a resource update"
+    assert not px.flush_called, (
+        "Scaler must NOT flush swap when RAM headroom is insufficient"
+    )
 
 
 if __name__ == "__main__":
@@ -299,4 +416,6 @@ if __name__ == "__main__":
     test_scaler_min_ram_floor()
     test_scaler_small_deficit_triggers_update()
     test_scaler_swap_flush_triggered()
+    test_scaler_dynamic_swap_sizing()
+    test_scaler_safe_flush_guard()
     print("All mock tests passed!")

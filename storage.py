@@ -39,9 +39,18 @@ def init_db():
             lxc_id TEXT,
             timestamp REAL,
             predicted_cpu REAL,
-            predicted_ram REAL
+            predicted_ram REAL,
+            predicted_swap REAL DEFAULT 0.0
         )
     """)
+
+    # Migration: add predicted_swap to pre-existing databases that lack it
+    try:
+        cursor.execute(
+            "ALTER TABLE prediction_logs ADD COLUMN predicted_swap REAL DEFAULT 0.0"
+        )
+    except Exception:  # pylint: disable=broad-except
+        pass  # Column already exists — normal on subsequent startups
 
     # Create an index for faster time-series querying during batch training
     cursor.execute("""
@@ -122,7 +131,9 @@ def get_baselines() -> Dict[str, Dict]:
     return baselines
 
 
-def log_prediction(lxc_id: str, predicted_cpu: float, predicted_ram: float):
+def log_prediction(
+    lxc_id: str, predicted_cpu: float, predicted_ram: float, predicted_swap: float = 0.0
+):
     """
     Saves a prediction to the database so the batch training script can
     compare it against actual historical usage later to calculate penalties.
@@ -133,10 +144,10 @@ def log_prediction(lxc_id: str, predicted_cpu: float, predicted_ram: float):
     current_time = time.time()
     cursor.execute(
         """
-        INSERT INTO prediction_logs (lxc_id, timestamp, predicted_cpu, predicted_ram)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO prediction_logs (lxc_id, timestamp, predicted_cpu, predicted_ram, predicted_swap)
+        VALUES (?, ?, ?, ?, ?)
     """,
-        (str(lxc_id), current_time, predicted_cpu, predicted_ram),
+        (str(lxc_id), current_time, predicted_cpu, predicted_ram, predicted_swap),
     )
 
     conn.commit()

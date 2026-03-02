@@ -124,6 +124,7 @@ def run():
                         lxc_id,
                         predicted_usage["cpu_percent"],
                         predicted_usage["ram_usage_mb"],
+                        predicted_usage.get("predicted_swap_mb", 0.0),
                     )
                 except Exception as db_err:
                     logger.warning(
@@ -207,6 +208,7 @@ def run():
                         vm_id,
                         predicted_usage["cpu_percent"],
                         predicted_usage["ram_usage_mb"],
+                        predicted_usage.get("predicted_swap_mb", 0.0),
                     )
                 except Exception as db_err:
                     logger.warning(

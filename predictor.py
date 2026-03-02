@@ -85,6 +85,10 @@ class Predictor:
         highest_recent_ram = float(
             max(m.get("mem", 0.0) / (1024 * 1024) for m in metrics)
         )
+        # Swap is present in LXC RRD data; absent for VMs (default 0)
+        highest_recent_swap = float(
+            max(m.get("swap", 0.0) / (1024 * 1024) for m in metrics)
+        )
 
         # Explicit memory optimization: We no longer need the heavy original RRD json array
         # or the large filtered array. Free them before we spin up Scikit-Learn matrices.
@@ -97,12 +101,15 @@ class Predictor:
 
         if len(metrics) < 15:
             # Not enough data for the rigid XGBoost feature array, fallback
+            fallback_swap = latest.get("swap", 0.0) / (1024 * 1024)
             del metrics
             return {
                 "cpu_percent": fallback_cpu,
                 "ram_usage_mb": fallback_ram,
                 "recent_peak_cpu": highest_recent_cpu,
                 "recent_peak_ram": highest_recent_ram,
+                "predicted_swap_mb": fallback_swap,
+                "recent_peak_swap": highest_recent_swap,
             }
 
         # Try to load models
@@ -112,6 +119,7 @@ class Predictor:
 
         pred_cpu = fallback_cpu
         pred_ram = fallback_ram
+        pred_swap = latest.get("swap", 0.0) / (1024 * 1024)
 
         if os.path.exists(cpu_model_path) and os.path.exists(ram_model_path):
             try:
@@ -132,6 +140,14 @@ class Predictor:
                     pred_cpu = max(0.0, float(model_cpu.predict(dmatrix)[0]))
                     pred_ram = max(0.0, float(model_ram.predict(dmatrix)[0]))
 
+                    # Swap model is optional (only exists if LXC has used swap historically)
+                    swap_model_path = os.path.join(
+                        self.models_dir, f"{prefix}_{entity_id}_swap.json"
+                    )
+                    model_swap = self._get_model(swap_model_path)
+                    if model_swap:
+                        pred_swap = max(0.0, float(model_swap.predict(dmatrix)[0]))
+
             except Exception as e:
                 logger.error(
                     f"Failed to run XGBoost inference for {entity_type} {entity_id}: {e}"
@@ -149,4 +165,6 @@ class Predictor:
             "ram_usage_mb": pred_ram,
             "recent_peak_cpu": highest_recent_cpu,
             "recent_peak_ram": highest_recent_ram,
+            "predicted_swap_mb": pred_swap,
+            "recent_peak_swap": highest_recent_swap,
         }
