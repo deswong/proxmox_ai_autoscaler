@@ -37,6 +37,20 @@ def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
     else:
         rrd_data = px_client.get_vm_rrd_history(entity_id, timeframe=timeframe)
 
+    # Load error penalties from prediction_logs BEFORE building the matrix.
+    # Maps {minute_ts: penalty_multiplier (1.0-3.0)} — empty on day one.
+    error_penalties = storage.get_prediction_errors(entity_id)
+    if error_penalties:
+        logger.info(
+            f"[{entity_type} {entity_id}] Loaded {len(error_penalties)} error-penalty "
+            f"buckets (avg penalty: {sum(error_penalties.values())/len(error_penalties):.2f}×)."
+        )
+    else:
+        logger.info(
+            f"[{entity_type} {entity_id}] No logged prediction errors yet — "
+            "using pure time-based weights for this training run."
+        )
+
     # Fetch node-level RRD for the same timeframe to provide host context features.
     # Build a {unix_time: {cpu%, ram%, swap%}} lookup keyed to the nearest minute.
     node_rrd = px_client.get_node_rrd_history(timeframe=timeframe)
@@ -84,7 +98,8 @@ def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
     X_matrix = []
     y_cpu = []
     y_ram = []
-    y_swap = []  # LXC only; stays empty for VMs
+    y_swap = []          # LXC only; stays empty for VMs
+    window_timestamps = []  # end-timestamp of each training window (for error-penalty lookup)
 
     # We need 15 past data points to predict 2 points into the future.
     # Full feature vector layout — MUST stay in sync with Predictor._build_context_features():
@@ -145,6 +160,7 @@ def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
         features.append(last.get("netout", 0.0) - first.get("netout", 0.0))
 
         X_matrix.append(features)
+        window_timestamps.append(window_ts)
         y_cpu.append(target.get("cpu", 0.0) * 100)
         y_ram.append(target.get("mem", 0.0) / (1024 * 1024))
         # Proxmox RRD returns swap in bytes for LXCs; default to 0 if absent
@@ -155,13 +171,37 @@ def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
     y_ram = np.array(y_ram)
     y_swap = np.array(y_swap)
 
-    # Time-based sample weights: more recent samples are given exponentially higher weight
-    # so the model prioritises current usage patterns over old historical data.
+    # Sample weights: compound time-recency with prediction-error penalties.
+    #
+    # 1. Time-recency: exponential ramp from e^0=1 to e^3≈20 so recent
+    #    intervals are favoured over old history.
+    # 2. Error penalty: for intervals where a previous model run made a
+    #    large prediction error (from prediction_logs telemetry), multiply
+    #    the sample weight by 1.0–3.0 so XGBoost trains harder on mistakes.
+    #
+    # Both components are then re-normalised so weights sum to 1.
     n_samples = len(X_matrix)
-    sample_weights = np.exp(
-        np.linspace(0, 3, n_samples)
-    )  # weight range: e^0=1.0 to e^3=~20
+    time_weights = np.exp(np.linspace(0, 3, n_samples))  # e^0 → e^3 ≈ 20
+
+    error_multipliers = np.ones(n_samples)
+    for i, window_ts in enumerate(window_timestamps):
+        minute_ts = int(window_ts) - (int(window_ts) % 60)
+        penalty = error_penalties.get(
+            minute_ts,
+            error_penalties.get(minute_ts - 60, 1.0),  # ±1 minute tolerance
+        )
+        error_multipliers[i] = penalty
+
+    sample_weights = time_weights * error_multipliers
     sample_weights /= sample_weights.sum()  # normalise so weights sum to 1
+
+    if error_penalties:
+        boosted = int((error_multipliers > 1.05).sum())
+        logger.info(
+            f"[{entity_type} {entity_id}] Error-penalty weighting applied: "
+            f"{boosted}/{n_samples} intervals boosted above 1× "
+            f"(max penalty: {error_multipliers.max():.2f}×)."
+        )
 
     logger.info(f"Training XGBoost Regressors for {entity_type} {entity_id}...")
 

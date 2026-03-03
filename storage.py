@@ -204,6 +204,69 @@ def log_prediction(
     conn.close()
 
 
+def get_prediction_errors(entity_id: str, days: int = 14) -> dict:
+    """
+    Returns a per-minute-bucket error scale factor derived from the gap between
+    predictions and actual observed usage in ``prediction_logs``.
+
+    For each logged cycle where both a predicted value AND an actual reading
+    (``ctx_actual_cpu``, ``ctx_actual_ram``) are stored, this computes:
+
+        cpu_err  = |predicted_cpu  - ctx_actual_cpu|   (percentage points)
+        ram_err  = |predicted_ram  - ctx_actual_ram|   (MB)
+
+    Both errors are normalised to [0, 1] over the window, summed, then
+    mapped to a **penalty multiplier** in the range [1.0, 3.0]:
+
+        penalty = 1.0 + 2.0 × norm_error    (so 0 error → 1×, max error → 3×)
+
+    The trainer multiplies the time-based sample weight for each training row
+    by the penalty for the nearest minute bucket, causing XGBoost to train
+    harder on time windows where it previously made large errors.
+
+    Returns a ``{minute_timestamp: penalty_multiplier}`` dict. Returns an
+    empty dict when no telemetry has been logged yet (day-one bootstrap).
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cutoff = time.time() - (days * 86400)
+    cursor.execute(
+        """
+        SELECT timestamp,
+               ABS(predicted_cpu - ctx_actual_cpu) AS cpu_err,
+               ABS(predicted_ram - ctx_actual_ram) AS ram_err
+        FROM prediction_logs
+        WHERE lxc_id = ?
+          AND timestamp >= ?
+          AND ctx_actual_cpu IS NOT NULL
+          AND ctx_actual_ram IS NOT NULL
+        ORDER BY timestamp
+        """,
+        (str(entity_id), cutoff),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        return {}
+
+    cpu_errors = [r["cpu_err"] or 0.0 for r in rows]
+    ram_errors = [r["ram_err"] or 0.0 for r in rows]
+
+    max_cpu = max(cpu_errors) or 1.0
+    max_ram = max(ram_errors) or 1.0
+
+    result = {}
+    for r, cpu_e, ram_e in zip(rows, cpu_errors, ram_errors):
+        norm = (cpu_e / max_cpu + ram_e / max_ram) / 2.0      # [0, 1]
+        penalty = 1.0 + 2.0 * norm                             # [1.0, 3.0]
+        # Key by nearest minute bucket so it aligns with RRD timestamps
+        minute_ts = int(r["timestamp"]) - (int(r["timestamp"]) % 60)
+        result[minute_ts] = max(result.get(minute_ts, 1.0), penalty)
+
+    return result
+
+
 def get_vm_rolling_peaks(entity_id: str, days: int = 14) -> dict:
     """
     Returns the rolling maximum CPU% and RAM usage observed for a VM/LXC over
