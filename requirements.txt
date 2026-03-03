@@ -1,7 +1,5 @@
 proxmoxer
 requests
 python-dotenv
-scikit-learn
 numpy
-xgboost
-pandas
+lightgbm

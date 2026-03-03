@@ -1,6 +1,6 @@
 import datetime
+import lightgbm as lgb
 import numpy as np
-import xgboost as xgb
 import logging
 import os
 from typing import List, Optional
@@ -12,19 +12,20 @@ class Predictor:
     def __init__(self, prediction_horizon=2, models_dir="./models"):
         """
         prediction_horizon: Number of future intervals (minutes) to predict.
-        models_dir: Location where the nightly training cron task will save the XGBoost .json weights.
+        models_dir: Location where the nightly training cron task saves LightGBM .lgb weights.
         """
         self.prediction_horizon = prediction_horizon
         self.models_dir = models_dir
         if not os.path.exists(models_dir):
             os.makedirs(models_dir)
 
-        self._model_cache = {}  # Store loaded models in RAM
+        self._model_cache = {}   # Store loaded Boosters in RAM
         self._model_mtimes = {}  # File modification times to detect fresh nightly trains
 
     def _get_model(self, model_path: str):
         """
-        Retrieves a cached XGBoost Booster from RAM, or loads it from disk if new/updated.
+        Retrieves a cached LightGBM Booster from RAM, or loads it from disk if new/updated.
+        Automatically handles missing files by evicting the stale cache entry.
         """
         if not os.path.exists(model_path):
             if model_path in self._model_cache:
@@ -40,13 +41,12 @@ class Predictor:
             return self._model_cache[model_path]
 
         try:
-            booster = xgb.Booster()
-            booster.load_model(model_path)
+            booster = lgb.Booster(model_file=model_path)
             self._model_cache[model_path] = booster
             self._model_mtimes[model_path] = mtime
             return booster
         except Exception as e:
-            logger.error(f"Failed to load XGBoost model from {model_path}: {e}")
+            logger.error(f"Failed to load LightGBM model from {model_path}: {e}")
             return None
 
     @staticmethod
@@ -91,7 +91,7 @@ class Predictor:
             float(host_context.get("ram_overcommit_ratio", 0.0)),
             float(host_context.get("container_count", 0.0)),
             0.0,  # reserved for future use
-            # Temporal (2)
+            # Temporal (2) — declared as categoricals in LightGBM training
             float(now.hour),
             float(now.weekday()),
             # Rate-of-change deltas (6)
@@ -112,8 +112,8 @@ class Predictor:
     ) -> dict:
         """
         Takes chronological data from Proxmox RRD API.
-        Only performs fast inference using pre-trained XGBoost weights.
-        If no weights exist yet (first day), falls back to the latest telemetry reading.
+        Runs fast inference using pre-trained LightGBM weights.
+        Falls back to the latest telemetry reading if no model exists yet.
 
         Feature vector layout (107 total):
           [0–89]   Per-container history:  6 × 15 intervals
@@ -121,12 +121,8 @@ class Predictor:
           [90–99]  Node health context:    10 scalars
                    host_cpu%, host_ram%, host_swap%, load_1m, load_5m,
                    ksm_mb, cpu_overcommit, ram_overcommit, container_count, reserved
-          [100–101] Temporal:             2 scalars (hour_of_day, day_of_week)
-          [101–106] Deltas:               6 scalars (last − first of window)
-
-        host_context keys (all optional, default 0.0):
-          cpu_percent, ram_percent, swap_percent, load_avg_1m, load_avg_5m,
-          ksm_sharing_mb, cpu_overcommit_ratio, ram_overcommit_ratio, container_count
+          [100–101] Temporal (LightGBM categoricals): hour_of_day, day_of_week
+          [101–106] Deltas:  6 scalars (last − first of window)
         """
         if host_context is None:
             host_context = {}
@@ -177,8 +173,8 @@ class Predictor:
             }
 
         prefix = entity_type.lower()
-        cpu_model_path = os.path.join(self.models_dir, f"{prefix}_{entity_id}_cpu.json")
-        ram_model_path = os.path.join(self.models_dir, f"{prefix}_{entity_id}_ram.json")
+        cpu_model_path = os.path.join(self.models_dir, f"{prefix}_{entity_id}_cpu.lgb")
+        ram_model_path = os.path.join(self.models_dir, f"{prefix}_{entity_id}_ram.lgb")
 
         pred_cpu = fallback_cpu
         pred_ram = fallback_ram
@@ -186,7 +182,8 @@ class Predictor:
 
         if os.path.exists(cpu_model_path) and os.path.exists(ram_model_path):
             try:
-                # 90 per-interval features (6 × 15)
+                # Build 107-feature vector as a 2D numpy array for LightGBM
+                # (no DMatrix wrapper needed — LightGBM accepts numpy arrays directly)
                 X_features = []
                 for m in metrics:
                     X_features.append(m.get("cpu", 0.0) * 100)
@@ -196,31 +193,31 @@ class Predictor:
                     X_features.append(m.get("netin", 0.0))
                     X_features.append(m.get("netout", 0.0))
 
-                # 17 global context features (node health + temporal + deltas)
                 X_features.extend(self._build_context_features(metrics, host_context))
+                X = np.array([X_features])  # shape (1, 107)
 
                 model_cpu = self._get_model(cpu_model_path)
                 model_ram = self._get_model(ram_model_path)
 
                 if model_cpu and model_ram:
-                    dmatrix = xgb.DMatrix(np.array([X_features]))
-                    pred_cpu = max(0.0, float(model_cpu.predict(dmatrix)[0]))
-                    pred_ram = max(0.0, float(model_ram.predict(dmatrix)[0]))
+                    pred_cpu = max(0.0, float(model_cpu.predict(X)[0]))
+                    pred_ram = max(0.0, float(model_ram.predict(X)[0]))
 
                     swap_model_path = os.path.join(
-                        self.models_dir, f"{prefix}_{entity_id}_swap.json"
+                        self.models_dir, f"{prefix}_{entity_id}_swap.lgb"
                     )
                     model_swap = self._get_model(swap_model_path)
                     if model_swap:
-                        pred_swap = max(0.0, float(model_swap.predict(dmatrix)[0]))
+                        pred_swap = max(0.0, float(model_swap.predict(X)[0]))
 
             except Exception as e:
                 logger.error(
-                    f"Failed to run XGBoost inference for {entity_type} {entity_id}: {e}"
+                    f"Failed to run LightGBM inference for {entity_type} {entity_id}: {e}"
                 )
         else:
             logger.debug(
-                f"No XGBoost models found yet for {entity_type} {entity_id}. Falling back to live metrics."
+                f"No LightGBM models found yet for {entity_type} {entity_id}. "
+                "Falling back to live metrics."
             )
 
         del metrics

@@ -2,7 +2,7 @@ import datetime
 import os
 import logging
 import numpy as np
-import xgboost as xgb
+import lightgbm as lgb
 from config import EXCLUDED_LXCS, EXCLUDED_VMS, TRAINING_DAYS_LOOKBACK
 from proxmox_api import ProxmoxClient
 import storage
@@ -18,7 +18,8 @@ logger = logging.getLogger("train_models")
 def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
     """
     Pulls historical RRD data based on the configured lookback window,
-    constructs the feature matrix, and trains an XGBoost model.
+    constructs the feature matrix, and trains three LightGBM regressors:
+    one for CPU%, one for RAM MB, and one for swap MB (LXC only).
     """
     # Proxmox API only accepts specific timeframe strings.
     if TRAINING_DAYS_LOOKBACK <= 7:
@@ -203,32 +204,61 @@ def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
             f"(max penalty: {error_multipliers.max():.2f}×)."
         )
 
-    logger.info(f"Training XGBoost Regressors for {entity_type} {entity_id}...")
+    logger.info(f"Training LightGBM regressors for {entity_type} {entity_id}...")
 
-    _xgb_params = {
-        "n_estimators": 100, "learning_rate": 0.1, "max_depth": 5,
-        "objective": "reg:squarederror",
+    # LightGBM params — DART booster reduces over-fitting on the recency-weighted distribution.
+    # hour_of_day (feature index 100) and day_of_week (101) are declared as ordered categoricals
+    # so LightGBM learns temporal thresholds rather than treating them as continuous floats.
+    _lgb_params = {
+        "objective": "regression",
+        "metric": "rmse",
+        "boosting_type": "dart",
+        "num_leaves": 63,
+        "learning_rate": 0.05,
+        "feature_fraction": 0.8,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 5,
+        "verbose": -1,
     }
-
-    model_cpu = xgb.XGBRegressor(**_xgb_params)
-    model_cpu.fit(X_matrix, y_cpu, sample_weight=sample_weights)
-
-    model_ram = xgb.XGBRegressor(**_xgb_params)
-    model_ram.fit(X_matrix, y_ram, sample_weight=sample_weights)
+    # Feature indices of temporals — these are declared categorical so LightGBM
+    # groups hours and weekdays into ordered buckets rather than treating them as floats.
+    _categorical_features = [100, 101]
+    _num_boost_round = 300
 
     if not os.path.exists(models_dir):
         os.makedirs(models_dir)
 
     prefix = entity_type.lower()
-    model_cpu.save_model(os.path.join(models_dir, f"{prefix}_{entity_id}_cpu.json"))
-    model_ram.save_model(os.path.join(models_dir, f"{prefix}_{entity_id}_ram.json"))
+
+    ds_cpu = lgb.Dataset(
+        X_matrix, label=y_cpu,
+        weight=sample_weights,
+        categorical_feature=_categorical_features,
+        free_raw_data=True,
+    )
+    model_cpu = lgb.train(_lgb_params, ds_cpu, num_boost_round=_num_boost_round)
+    model_cpu.save_model(os.path.join(models_dir, f"{prefix}_{entity_id}_cpu.lgb"))
+
+    ds_ram = lgb.Dataset(
+        X_matrix, label=y_ram,
+        weight=sample_weights,
+        categorical_feature=_categorical_features,
+        free_raw_data=True,
+    )
+    model_ram = lgb.train(_lgb_params, ds_ram, num_boost_round=_num_boost_round)
+    model_ram.save_model(os.path.join(models_dir, f"{prefix}_{entity_id}_ram.lgb"))
 
     # Swap predictor is LXC-only (VMs manage swap inside the guest OS)
     if entity_type == "LXC" and y_swap.sum() > 0:
-        model_swap = xgb.XGBRegressor(**_xgb_params)
-        model_swap.fit(X_matrix, y_swap, sample_weight=sample_weights)
+        ds_swap = lgb.Dataset(
+            X_matrix, label=y_swap,
+            weight=sample_weights,
+            categorical_feature=_categorical_features,
+            free_raw_data=True,
+        )
+        model_swap = lgb.train(_lgb_params, ds_swap, num_boost_round=_num_boost_round)
         model_swap.save_model(
-            os.path.join(models_dir, f"{prefix}_{entity_id}_swap.json")
+            os.path.join(models_dir, f"{prefix}_{entity_id}_swap.lgb")
         )
         logger.info(
             f"[LXC {entity_id}] Swap predictor trained "
@@ -241,12 +271,12 @@ def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
         )
 
     logger.info(
-        f"Successfully saved XGBoost models for {entity_type} {entity_id}."
+        f"Successfully saved LightGBM models for {entity_type} {entity_id}."
     )
 
 
 def run():
-    logger.info("Starting Nightly XGBoost Batch Training Daemon...")
+    logger.info("Starting Nightly LightGBM Batch Training Daemon...")
     px_client = ProxmoxClient()
     if not px_client.proxmox:
         logger.error("Failed to connect to Proxmox API.")
