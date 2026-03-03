@@ -1,11 +1,9 @@
 import datetime
 import os
 import logging
-import sqlite3
-import pandas as pd
 import numpy as np
 import xgboost as xgb
-from config import DATABASE_PATH, EXCLUDED_LXCS, EXCLUDED_VMS, TRAINING_DAYS_LOOKBACK
+from config import EXCLUDED_LXCS, EXCLUDED_VMS, TRAINING_DAYS_LOOKBACK
 from proxmox_api import ProxmoxClient
 import storage
 
@@ -15,34 +13,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("train_models")
 
-
-def calculate_recent_penalties(entity_id) -> dict:
-    """
-    Looks at the prediction_logs table to calculate the Mean Absolute Error (MAE)
-    of the predictions made natively by the live service against actual historical data.
-    """
-    try:
-        conn = sqlite3.connect(DATABASE_PATH)
-        df_preds = pd.read_sql_query(
-            "SELECT timestamp, predicted_cpu, predicted_ram FROM prediction_logs WHERE lxc_id=?",
-            conn,
-            params=(entity_id,),
-        )
-        conn.close()
-
-        if df_preds.empty:
-            return {"mae_cpu": 0.0, "mae_ram": 0.0, "count": 0}
-
-        # We won't fully join against massive RRD here, we'll just report basic stats of predictions
-        # For a full reinforcement model, this would compute the exact delta and apply it as Sample Weights.
-        return {
-            "avg_predicted_cpu": df_preds["predicted_cpu"].mean(),
-            "avg_predicted_ram": df_preds["predicted_ram"].mean(),
-            "count": len(df_preds),
-        }
-    except Exception as e:
-        logger.error(f"Error reading reinforcement logs for {entity_id}: {e}")
-        return {}
 
 
 def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
@@ -230,9 +200,8 @@ def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
             "skipping swap model (will use LXC_MIN_SWAP_MB floor)."
         )
 
-    stats = calculate_recent_penalties(entity_id)
     logger.info(
-        f"Successfully saved XGBoost models for {entity_type} {entity_id}. (Reinforcement entries processed: {stats.get('count', 0)})"
+        f"Successfully saved XGBoost models for {entity_type} {entity_id}."
     )
 
 

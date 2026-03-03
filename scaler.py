@@ -87,31 +87,6 @@ class Scaler:
         )
         target_cpus = max(baseline["min_cpus"], min(desired_cpus, baseline["max_cpus"]))
 
-        # Proxmox hotplug mechanism requires at least 1024 MB for VMs, and hot-unplug is generally unreliable
-        if entity_type == "VM":
-            if target_cpus < current_metrics["allocated_cpus"]:
-                # The prediction wanted to scale down CPU, but we block it
-                logger.info(
-                    f"[{entity_type} {entity_id}] VM CPU hot-unplug is generally unsupported by guest OS. Preventing CPU scale-down."
-                )
-                target_cpus = current_metrics["allocated_cpus"]
-
-            if target_ram < 1024:
-                if (
-                    target_ram != current_metrics["allocated_ram_mb"]
-                    and current_metrics["allocated_ram_mb"] >= 1024
-                ):
-                    logger.info(
-                        f"[{entity_type} {entity_id}] Enforcing Proxmox VM hotplug minimum of 1024 MB RAM."
-                    )
-                target_ram = 1024
-            if target_ram < current_metrics["allocated_ram_mb"]:
-                # The prediction wanted to scale down RAM, but we block it
-                logger.info(
-                    f"[{entity_type} {entity_id}] VM Memory hot-unplug is unreliable. Preventing RAM scale-down."
-                )
-                target_ram = current_metrics["allocated_ram_mb"]
-
         # 3. Check physical node limits before scaling UP
         # Fetch live host node metrics
         host_metrics = self.px.get_host_usage()

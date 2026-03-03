@@ -863,4 +863,3 @@ if __name__ == "__main__":
     test_vm_pending_config_bootstrap()
     test_vm_pending_config_no_change()
     print("All mock tests passed!")
-
