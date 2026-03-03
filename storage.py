@@ -40,17 +40,20 @@ def init_db():
             timestamp REAL,
             predicted_cpu REAL,
             predicted_ram REAL,
-            predicted_swap REAL DEFAULT 0.0
+            predicted_swap REAL DEFAULT 0.0,
+            pred_disk_read REAL DEFAULT 0.0,
+            pred_disk_write REAL DEFAULT 0.0,
+            pred_net_in REAL DEFAULT 0.0,
+            pred_net_out REAL DEFAULT 0.0
         )
     """)
 
-    # Migration: add predicted_swap to pre-existing databases that lack it
-    try:
-        cursor.execute(
-            "ALTER TABLE prediction_logs ADD COLUMN predicted_swap REAL DEFAULT 0.0"
-        )
-    except Exception:  # pylint: disable=broad-except
-        pass  # Column already exists — normal on subsequent startups
+    # Migrations: add columns to pre-existing databases that lack them
+    _migrate_add_column(cursor, "prediction_logs", "predicted_swap", "REAL DEFAULT 0.0")
+    _migrate_add_column(cursor, "prediction_logs", "pred_disk_read", "REAL DEFAULT 0.0")
+    _migrate_add_column(cursor, "prediction_logs", "pred_disk_write", "REAL DEFAULT 0.0")
+    _migrate_add_column(cursor, "prediction_logs", "pred_net_in", "REAL DEFAULT 0.0")
+    _migrate_add_column(cursor, "prediction_logs", "pred_net_out", "REAL DEFAULT 0.0")
 
     # Create an index for faster time-series querying during batch training
     cursor.execute("""
@@ -61,6 +64,14 @@ def init_db():
     conn.close()
 
     _seed_initial_baselines()
+
+
+def _migrate_add_column(cursor, table: str, column: str, col_type: str):
+    """Adds a column to an existing table if it does not yet exist."""
+    try:
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+    except Exception:  # pylint: disable=broad-except
+        pass  # Column already exists — normal on subsequent startups
 
 
 def _seed_initial_baselines():
@@ -132,7 +143,14 @@ def get_baselines() -> Dict[str, Dict]:
 
 
 def log_prediction(
-    lxc_id: str, predicted_cpu: float, predicted_ram: float, predicted_swap: float = 0.0
+    lxc_id: str,
+    predicted_cpu: float,
+    predicted_ram: float,
+    predicted_swap: float = 0.0,
+    pred_disk_read: float = 0.0,
+    pred_disk_write: float = 0.0,
+    pred_net_in: float = 0.0,
+    pred_net_out: float = 0.0,
 ):
     """
     Saves a prediction to the database so the batch training script can
@@ -144,10 +162,16 @@ def log_prediction(
     current_time = time.time()
     cursor.execute(
         """
-        INSERT INTO prediction_logs (lxc_id, timestamp, predicted_cpu, predicted_ram, predicted_swap)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO prediction_logs (
+            lxc_id, timestamp, predicted_cpu, predicted_ram, predicted_swap,
+            pred_disk_read, pred_disk_write, pred_net_in, pred_net_out
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """,
-        (str(lxc_id), current_time, predicted_cpu, predicted_ram, predicted_swap),
+        (
+            str(lxc_id), current_time, predicted_cpu, predicted_ram, predicted_swap,
+            pred_disk_read, pred_disk_write, pred_net_in, pred_net_out,
+        ),
     )
 
     conn.commit()

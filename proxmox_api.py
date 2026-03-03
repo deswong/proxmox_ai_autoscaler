@@ -201,6 +201,10 @@ class ProxmoxClient:
                     "swap_mb": float(lxc.get("swap", 0) / (1024 * 1024)),
                     "allocated_swap_mb": float(lxc.get("maxswap", 0) / (1024 * 1024)),
                     "uptime": int(lxc.get("uptime", 0)),
+                    "disk_read_bps": float(lxc.get("diskread", 0)),
+                    "disk_write_bps": float(lxc.get("diskwrite", 0)),
+                    "net_in_bps": float(lxc.get("netin", 0)),
+                    "net_out_bps": float(lxc.get("netout", 0)),
                 }
             return metrics_dict
         except Exception as e:
@@ -282,6 +286,10 @@ class ProxmoxClient:
                     "allocated_cpus": int(vm.get("cpus", 1)),
                     "allocated_ram_mb": float(vm.get("maxmem", 0) / (1024 * 1024)),
                     "uptime": int(vm.get("uptime", 0)),
+                    "disk_read_bps": float(vm.get("diskread", 0)),
+                    "disk_write_bps": float(vm.get("diskwrite", 0)),
+                    "net_in_bps": float(vm.get("netin", 0)),
+                    "net_out_bps": float(vm.get("netout", 0)),
                 }
             return metrics_dict
         except Exception as e:

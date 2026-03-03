@@ -6,14 +6,14 @@ def test_predictor():
     predictor = Predictor(prediction_horizon=2)
 
     # Simulate a rising trend
-    # format: [{'time': timestamp, 'cpu': ratio, 'mem': bytes}]
+    # format: [{'time': timestamp, 'cpu': ratio, 'mem': bytes, 'diskread': bps, ...}]
     base_time = time.time() - 300
     metrics = [
-        {"time": base_time, "cpu": 0.10, "mem": 512 * 1024 * 1024},
-        {"time": base_time + 60, "cpu": 0.20, "mem": 600 * 1024 * 1024},
-        {"time": base_time + 120, "cpu": 0.30, "mem": 750 * 1024 * 1024},
-        {"time": base_time + 180, "cpu": 0.50, "mem": 900 * 1024 * 1024},
-        {"time": base_time + 240, "cpu": 0.75, "mem": 1024 * 1024 * 1024},
+        {"time": base_time,       "cpu": 0.10, "mem": 512  * 1024 * 1024, "diskread": 0, "diskwrite": 0, "netin": 0, "netout": 0},
+        {"time": base_time + 60,  "cpu": 0.20, "mem": 600  * 1024 * 1024, "diskread": 0, "diskwrite": 0, "netin": 0, "netout": 0},
+        {"time": base_time + 120, "cpu": 0.30, "mem": 750  * 1024 * 1024, "diskread": 0, "diskwrite": 0, "netin": 0, "netout": 0},
+        {"time": base_time + 180, "cpu": 0.50, "mem": 900  * 1024 * 1024, "diskread": 0, "diskwrite": 0, "netin": 0, "netout": 0},
+        {"time": base_time + 240, "cpu": 0.75, "mem": 1024 * 1024 * 1024, "diskread": 0, "diskwrite": 0, "netin": 0, "netout": 0},
     ]
 
     # We pass entity_id="100", rrd_data=metrics, entity_type="LXC"
@@ -32,11 +32,11 @@ def test_predictor():
 
     # Simulate a falling trend
     metrics_falling = [
-        {"time": base_time, "cpu": 0.90, "mem": 2048 * 1024 * 1024},
-        {"time": base_time + 60, "cpu": 0.80, "mem": 1900 * 1024 * 1024},
-        {"time": base_time + 120, "cpu": 0.50, "mem": 1500 * 1024 * 1024},
-        {"time": base_time + 180, "cpu": 0.30, "mem": 1024 * 1024 * 1024},
-        {"time": base_time + 240, "cpu": 0.15, "mem": 512 * 1024 * 1024},
+        {"time": base_time,       "cpu": 0.90, "mem": 2048 * 1024 * 1024, "diskread": 0, "diskwrite": 0, "netin": 0, "netout": 0},
+        {"time": base_time + 60,  "cpu": 0.80, "mem": 1900 * 1024 * 1024, "diskread": 0, "diskwrite": 0, "netin": 0, "netout": 0},
+        {"time": base_time + 120, "cpu": 0.50, "mem": 1500 * 1024 * 1024, "diskread": 0, "diskwrite": 0, "netin": 0, "netout": 0},
+        {"time": base_time + 180, "cpu": 0.30, "mem": 1024 * 1024 * 1024, "diskread": 0, "diskwrite": 0, "netin": 0, "netout": 0},
+        {"time": base_time + 240, "cpu": 0.15, "mem": 512  * 1024 * 1024, "diskread": 0, "diskwrite": 0, "netin": 0, "netout": 0},
     ]
 
     predictions_fallback = predictor.predict_next_usage("100", metrics_falling, "LXC")
@@ -50,6 +50,40 @@ def test_predictor():
     assert (
         predictions_fallback["ram_usage_mb"] == 512.0
     ), "RAM Prediction fallback should match the latest metric"
+
+
+def test_predictor_new_metric_keys():
+    """Predictor output must expose all four I/O peak keys so callers can log/display them."""
+    predictor = Predictor(prediction_horizon=2)
+
+    base_time = time.time() - 300
+    # 5 points -> hits the <15 fallback path; verifies the keys are included even there
+    metrics = [
+        {
+            "time": base_time + i * 60,
+            "cpu": 0.10,
+            "mem": 512 * 1024 * 1024,
+            "diskread": 1024 * 1024 * (i + 1),   # rising disk read
+            "diskwrite": 512 * 1024 * (i + 1),
+            "netin": 100_000 * (i + 1),
+            "netout": 50_000 * (i + 1),
+        }
+        for i in range(5)
+    ]
+
+    result = predictor.predict_next_usage("999", metrics, "LXC")
+
+    print("\nTesting New I/O Peak Keys Present in Predictor Output:")
+    print(f"Predicted Output: {result}")
+
+    for key in (
+        "recent_peak_disk_read",
+        "recent_peak_disk_write",
+        "recent_peak_net_in",
+        "recent_peak_net_out",
+    ):
+        assert key in result, f"Expected key '{key}' in predictor output"
+        assert result[key] > 0, f"Expected non-zero peak for '{key}' given rising I/O fixture"
 
 
 def test_scaler():
@@ -409,6 +443,7 @@ def test_scaler_safe_flush_guard():
         "Scaler must NOT flush swap when RAM headroom is insufficient"
     )
 
+
 def test_scaler_swap_cap_corrected_without_ram_change():
     """Regression test: when RAM and CPU are adequate but the swap cap differs
     significantly from the target, the scaler must still issue an update to
@@ -459,7 +494,7 @@ def test_scaler_swap_cap_corrected_without_ram_change():
         "allocated_ram_mb": 2048.0,
         "ram_usage_mb": 900.0,
         "cpu_percent": 10.0,
-        "swap_mb": 30.0,            # Low swap usage — below flush threshold
+        "swap_mb": 30.0,              # Low swap usage — below flush threshold
         "allocated_swap_mb": 2048.0,  # Old Proxmox default (huge)
     }
 
@@ -480,6 +515,7 @@ def test_scaler_swap_cap_corrected_without_ram_change():
     assert px.last_update["swap_mb"] >= 256, (
         f"Swap cap should be at least LXC_MIN_SWAP_MB=256, got {px.last_update['swap_mb']}"
     )
+
 
 def test_scaler_host_swap_safety_cap():
     """Scaler must refuse to scale UP CPU or RAM when host swap usage exceeds MAX_HOST_SWAP_USAGE_PERCENT."""
@@ -524,6 +560,7 @@ def test_scaler_host_swap_safety_cap():
 if __name__ == "__main__":
     print("Running Mock AI Predictor Tests...")
     test_predictor()
+    test_predictor_new_metric_keys()
     test_scaler()
     test_scaler_uses_peak_ram()
     test_scaler_min_ram_floor()

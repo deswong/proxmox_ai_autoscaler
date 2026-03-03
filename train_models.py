@@ -84,7 +84,9 @@ def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
     y_ram = []
     y_swap = []  # LXC only; stays empty for VMs
 
-    # We need 15 past data points to predict 2 points into the future
+    # We need 15 past data points to predict 2 points into the future.
+    # Feature vector per interval (6 features × 15 intervals = 90 total):
+    #   cpu_percent, mem_mb, disk_read_bps, disk_write_bps, net_in_bps, net_out_bps
     PREDICTION_HORIZON = 2
     LOOKBACK = 15
 
@@ -92,11 +94,16 @@ def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
         past_window = valid_metrics[i - LOOKBACK : i]
         target = valid_metrics[i + PREDICTION_HORIZON]
 
-        # Flatten the 15 past intervals into 30 features
+        # Flatten the 15 past intervals into 90 features (6 per interval).
+        # Disk and network fields default to 0.0 when absent from historical RRD data.
         features = []
         for m in past_window:
             features.append(m.get("cpu", 0.0) * 100)
             features.append(m.get("mem", 0.0) / (1024 * 1024))
+            features.append(m.get("diskread", 0.0))
+            features.append(m.get("diskwrite", 0.0))
+            features.append(m.get("netin", 0.0))
+            features.append(m.get("netout", 0.0))
 
         X_matrix.append(features)
         y_cpu.append(target.get("cpu", 0.0) * 100)

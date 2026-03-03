@@ -65,6 +65,9 @@ class Predictor:
         Takes chronological data from Proxmox RRD API.
         Only performs fast inference using pre-trained XGBoost weights.
         If no weights exist yet (first day), falls back to the latest telemetry reading safely.
+
+        Feature vector per interval (6 features × 15 intervals = 90 total):
+          [cpu_percent, mem_mb, disk_read_bps, disk_write_bps, net_in_bps, net_out_bps]
         """
         # Filter out invalid or purely null/0 data points that might appear in RRD
         valid_metrics = [
@@ -89,6 +92,11 @@ class Predictor:
         highest_recent_swap = float(
             max(m.get("swap", 0.0) / (1024 * 1024) for m in metrics)
         )
+        # I/O rate peaks — default 0.0 if the field is absent (older RRD data)
+        highest_recent_disk_read = float(max(m.get("diskread", 0.0) for m in metrics))
+        highest_recent_disk_write = float(max(m.get("diskwrite", 0.0) for m in metrics))
+        highest_recent_net_in = float(max(m.get("netin", 0.0) for m in metrics))
+        highest_recent_net_out = float(max(m.get("netout", 0.0) for m in metrics))
 
         # Explicit memory optimization: We no longer need the heavy original RRD json array
         # or the large filtered array. Free them before we spin up Scikit-Learn matrices.
@@ -110,6 +118,10 @@ class Predictor:
                 "recent_peak_ram": highest_recent_ram,
                 "predicted_swap_mb": fallback_swap,
                 "recent_peak_swap": highest_recent_swap,
+                "recent_peak_disk_read": highest_recent_disk_read,
+                "recent_peak_disk_write": highest_recent_disk_write,
+                "recent_peak_net_in": highest_recent_net_in,
+                "recent_peak_net_out": highest_recent_net_out,
             }
 
         # Try to load models
@@ -123,11 +135,17 @@ class Predictor:
 
         if os.path.exists(cpu_model_path) and os.path.exists(ram_model_path):
             try:
-                # Prepare data identically to training phase: flatten the 15 intervals into 30 features
+                # Build feature vector: 6 features × 15 intervals = 90 columns.
+                # Feature order matches train_models.py exactly:
+                #   cpu_percent, mem_mb, disk_read_bps, disk_write_bps, net_in_bps, net_out_bps
                 X_features = []
                 for m in metrics:
-                    X_features.append((m.get("cpu", 0.0) * 100))
-                    X_features.append((m.get("mem", 0.0) / (1024 * 1024)))
+                    X_features.append(m.get("cpu", 0.0) * 100)
+                    X_features.append(m.get("mem", 0.0) / (1024 * 1024))
+                    X_features.append(m.get("diskread", 0.0))
+                    X_features.append(m.get("diskwrite", 0.0))
+                    X_features.append(m.get("netin", 0.0))
+                    X_features.append(m.get("netout", 0.0))
 
                 # Retrieve from lightning RAM cache instead of Disk Load
                 model_cpu = self._get_model(cpu_model_path)
@@ -167,4 +185,8 @@ class Predictor:
             "recent_peak_ram": highest_recent_ram,
             "predicted_swap_mb": pred_swap,
             "recent_peak_swap": highest_recent_swap,
+            "recent_peak_disk_read": highest_recent_disk_read,
+            "recent_peak_disk_write": highest_recent_disk_write,
+            "recent_peak_net_in": highest_recent_net_in,
+            "recent_peak_net_out": highest_recent_net_out,
         }

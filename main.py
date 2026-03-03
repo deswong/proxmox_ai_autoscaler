@@ -125,6 +125,10 @@ def run():
                         predicted_usage["cpu_percent"],
                         predicted_usage["ram_usage_mb"],
                         predicted_usage.get("predicted_swap_mb", 0.0),
+                        predicted_usage.get("recent_peak_disk_read", 0.0),
+                        predicted_usage.get("recent_peak_disk_write", 0.0),
+                        predicted_usage.get("recent_peak_net_in", 0.0),
+                        predicted_usage.get("recent_peak_net_out", 0.0),
                     )
                 except Exception as db_err:
                     logger.warning(
@@ -209,6 +213,10 @@ def run():
                         predicted_usage["cpu_percent"],
                         predicted_usage["ram_usage_mb"],
                         predicted_usage.get("predicted_swap_mb", 0.0),
+                        predicted_usage.get("recent_peak_disk_read", 0.0),
+                        predicted_usage.get("recent_peak_disk_write", 0.0),
+                        predicted_usage.get("recent_peak_net_in", 0.0),
+                        predicted_usage.get("recent_peak_net_out", 0.0),
                     )
                 except Exception as db_err:
                     logger.warning(
