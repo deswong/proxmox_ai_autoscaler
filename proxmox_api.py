@@ -36,9 +36,17 @@ class ProxmoxClient:
             self.proxmox = None
 
     def get_host_usage(self) -> dict:
-        """Fetches the current CPU and RAM usage of the host node."""
+        """
+        Fetches CPU, RAM, swap, load averages, KSM activity, and physical CPU
+        count from the host node. All data from a single node.status.get() call.
+        """
+        _empty = {
+            "cpu_percent": 0.0, "ram_percent": 0.0, "swap_percent": 0.0,
+            "total_ram_mb": 0.0, "physical_cpus": 1,
+            "load_avg_1m": 0.0, "load_avg_5m": 0.0, "ksm_sharing_mb": 0.0,
+        }
         if not self.proxmox:
-            return {"cpu_percent": 0.0, "ram_percent": 0.0, "total_ram_mb": 0.0}
+            return _empty
 
         try:
             status = self.node.status.get()
@@ -56,15 +64,33 @@ class ProxmoxClient:
             swap_used = status.get("swap", {}).get("used", 0)
             swap_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
 
+            # load averages (1-min, 5-min) — list of strings
+            loadavg = status.get("loadavg", ["0", "0", "0"])
+            load_1m = float(loadavg[0]) if len(loadavg) > 0 else 0.0
+            load_5m = float(loadavg[1]) if len(loadavg) > 1 else 0.0
+
+            # KSM — bytes of memory currently shared by Kernel Same-Page Merging
+            ksm_sharing_mb = float(
+                status.get("ksm", {}).get("shared", 0) / (1024 * 1024)
+            )
+
+            # Physical CPU count for overcommit ratio computation
+            physical_cpus = int(status.get("cpuinfo", {}).get("cpus", 1)) or 1
+
             return {
                 "cpu_percent": float(cpu_percent),
                 "ram_percent": float(ram_percent),
                 "swap_percent": float(swap_percent),
-                "total_ram_mb": mem_total / (1024 * 1024),
+                "total_ram_mb": float(mem_total / (1024 * 1024)),
+                "physical_cpus": physical_cpus,
+                "load_avg_1m": load_1m,
+                "load_avg_5m": load_5m,
+                "ksm_sharing_mb": ksm_sharing_mb,
             }
         except Exception as e:
             logger.error(f"Failed to fetch host usage: {e}")
-            return {"cpu_percent": 0.0, "ram_percent": 0.0, "total_ram_mb": 0.0}
+            return _empty
+
 
     def update_lxc_resources(self, lxc_id: str, cpus: int, ram_mb: int, swap_mb: int = 0):
         """Updates the CPU cores and RAM allocation of a running LXC."""

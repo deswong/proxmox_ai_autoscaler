@@ -1,3 +1,4 @@
+import datetime
 import time
 import logging
 from config import POLL_INTERVAL_SECONDS, EXCLUDED_LXCS, EXCLUDED_VMS
@@ -58,6 +59,19 @@ def run():
 
         # 3b. Fetch host node metrics once per cycle — used as ML context AND safety caps
         host_metrics = px_client.get_host_usage()
+
+        # 3c. Compute cluster overcommit ratios from data already in RAM (zero extra API calls).
+        #     These are merged into host_context so both the predictor and the log entry
+        #     see the current tenant density on the hypervisor.
+        all_containers = {**all_lxc_metrics, **all_vm_metrics}
+        physical_cpus = max(host_metrics.get("physical_cpus", 1), 1)
+        total_ram_mb = max(host_metrics.get("total_ram_mb", 1.0), 1.0)
+        total_alloc_cpus = sum(m.get("allocated_cpus", 0) for m in all_containers.values())
+        total_alloc_ram = sum(m.get("allocated_ram_mb", 0.0) for m in all_containers.values())
+        host_metrics["cpu_overcommit_ratio"] = total_alloc_cpus / physical_cpus
+        host_metrics["ram_overcommit_ratio"] = total_alloc_ram / total_ram_mb
+        host_metrics["container_count"] = float(len(all_containers))
+        _now = datetime.datetime.now()
 
         # 4. Evaluate each discovered LXC
         for lxc_id, current_metrics in all_lxc_metrics.items():
@@ -133,6 +147,15 @@ def run():
                         predicted_usage.get("recent_peak_disk_write", 0.0),
                         predicted_usage.get("recent_peak_net_in", 0.0),
                         predicted_usage.get("recent_peak_net_out", 0.0),
+                        ctx_hour=_now.hour,
+                        ctx_dow=_now.weekday(),
+                        ctx_host_load_1m=host_metrics.get("load_avg_1m", 0.0),
+                        ctx_host_load_5m=host_metrics.get("load_avg_5m", 0.0),
+                        ctx_cpu_overcommit=host_metrics.get("cpu_overcommit_ratio", 0.0),
+                        ctx_ram_overcommit=host_metrics.get("ram_overcommit_ratio", 0.0),
+                        ctx_container_count=int(host_metrics.get("container_count", 0)),
+                        ctx_actual_cpu=current_metrics.get("cpu_percent", 0.0),
+                        ctx_actual_ram=current_metrics.get("ram_usage_mb", 0.0),
                     )
                 except Exception as db_err:
                     logger.warning(
@@ -222,6 +245,15 @@ def run():
                         predicted_usage.get("recent_peak_disk_write", 0.0),
                         predicted_usage.get("recent_peak_net_in", 0.0),
                         predicted_usage.get("recent_peak_net_out", 0.0),
+                        ctx_hour=_now.hour,
+                        ctx_dow=_now.weekday(),
+                        ctx_host_load_1m=host_metrics.get("load_avg_1m", 0.0),
+                        ctx_host_load_5m=host_metrics.get("load_avg_5m", 0.0),
+                        ctx_cpu_overcommit=host_metrics.get("cpu_overcommit_ratio", 0.0),
+                        ctx_ram_overcommit=host_metrics.get("ram_overcommit_ratio", 0.0),
+                        ctx_container_count=int(host_metrics.get("container_count", 0)),
+                        ctx_actual_cpu=current_metrics.get("cpu_percent", 0.0),
+                        ctx_actual_ram=current_metrics.get("ram_usage_mb", 0.0),
                     )
                 except Exception as db_err:
                     logger.warning(

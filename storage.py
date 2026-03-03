@@ -54,6 +54,16 @@ def init_db():
     _migrate_add_column(cursor, "prediction_logs", "pred_disk_write", "REAL DEFAULT 0.0")
     _migrate_add_column(cursor, "prediction_logs", "pred_net_in", "REAL DEFAULT 0.0")
     _migrate_add_column(cursor, "prediction_logs", "pred_net_out", "REAL DEFAULT 0.0")
+    # Context telemetry columns (added in v3 — rich per-cycle environment snapshot)
+    _migrate_add_column(cursor, "prediction_logs", "ctx_hour", "INTEGER DEFAULT 0")
+    _migrate_add_column(cursor, "prediction_logs", "ctx_dow", "INTEGER DEFAULT 0")
+    _migrate_add_column(cursor, "prediction_logs", "ctx_host_load_1m", "REAL DEFAULT 0.0")
+    _migrate_add_column(cursor, "prediction_logs", "ctx_host_load_5m", "REAL DEFAULT 0.0")
+    _migrate_add_column(cursor, "prediction_logs", "ctx_cpu_overcommit", "REAL DEFAULT 0.0")
+    _migrate_add_column(cursor, "prediction_logs", "ctx_ram_overcommit", "REAL DEFAULT 0.0")
+    _migrate_add_column(cursor, "prediction_logs", "ctx_container_count", "INTEGER DEFAULT 0")
+    _migrate_add_column(cursor, "prediction_logs", "ctx_actual_cpu", "REAL DEFAULT 0.0")
+    _migrate_add_column(cursor, "prediction_logs", "ctx_actual_ram", "REAL DEFAULT 0.0")
 
     # Create an index for faster time-series querying during batch training
     cursor.execute("""
@@ -151,10 +161,20 @@ def log_prediction(
     pred_disk_write: float = 0.0,
     pred_net_in: float = 0.0,
     pred_net_out: float = 0.0,
+    ctx_hour: int = 0,
+    ctx_dow: int = 0,
+    ctx_host_load_1m: float = 0.0,
+    ctx_host_load_5m: float = 0.0,
+    ctx_cpu_overcommit: float = 0.0,
+    ctx_ram_overcommit: float = 0.0,
+    ctx_container_count: int = 0,
+    ctx_actual_cpu: float = 0.0,
+    ctx_actual_ram: float = 0.0,
 ):
     """
-    Saves a prediction to the database so the batch training script can
-    compare it against actual historical usage later to calculate penalties.
+    Saves a prediction to the database along with the full environment context
+    observed at the moment of prediction. This rich per-cycle snapshot lets future
+    training runs use actual load_avg / overcommit data instead of placeholder zeros.
     """
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -164,13 +184,19 @@ def log_prediction(
         """
         INSERT INTO prediction_logs (
             lxc_id, timestamp, predicted_cpu, predicted_ram, predicted_swap,
-            pred_disk_read, pred_disk_write, pred_net_in, pred_net_out
+            pred_disk_read, pred_disk_write, pred_net_in, pred_net_out,
+            ctx_hour, ctx_dow, ctx_host_load_1m, ctx_host_load_5m,
+            ctx_cpu_overcommit, ctx_ram_overcommit, ctx_container_count,
+            ctx_actual_cpu, ctx_actual_ram
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """,
         (
             str(lxc_id), current_time, predicted_cpu, predicted_ram, predicted_swap,
             pred_disk_read, pred_disk_write, pred_net_in, pred_net_out,
+            ctx_hour, ctx_dow, ctx_host_load_1m, ctx_host_load_5m,
+            ctx_cpu_overcommit, ctx_ram_overcommit, ctx_container_count,
+            ctx_actual_cpu, ctx_actual_ram,
         ),
     )
 

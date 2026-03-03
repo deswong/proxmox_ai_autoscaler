@@ -1,3 +1,4 @@
+import datetime
 import numpy as np
 import xgboost as xgb
 import logging
@@ -19,44 +20,88 @@ class Predictor:
             os.makedirs(models_dir)
 
         self._model_cache = {}  # Store loaded models in RAM
-        self._model_mtimes = (
-            {}
-        )  # Store file modification times to detect fresh nightly trains
+        self._model_mtimes = {}  # File modification times to detect fresh nightly trains
 
     def _get_model(self, model_path: str):
         """
-        Retrieves a cached XGBoost Booster from RAM, or loads it from disk if it's new/updated.
+        Retrieves a cached XGBoost Booster from RAM, or loads it from disk if new/updated.
         """
         if not os.path.exists(model_path):
-            # Explicit RAM optimization: If the user deleted the container or added it to EXCLUDE_List,
-            # the nightly trainer will delete the .json file. We must evict it from RAM.
             if model_path in self._model_cache:
                 del self._model_cache[model_path]
                 del self._model_mtimes[model_path]
             return None
 
         mtime = os.path.getmtime(model_path)
-
-        # Cache hit
         if (
             model_path in self._model_cache
             and self._model_mtimes.get(model_path) == mtime
         ):
             return self._model_cache[model_path]
 
-        # Cache miss or file was updated
         try:
-            # Using raw Booster is fundamentally faster and lighter than the Scikit-Learn XGBRegressor wrapper
             booster = xgb.Booster()
             booster.load_model(model_path)
             self._model_cache[model_path] = booster
             self._model_mtimes[model_path] = mtime
             return booster
         except Exception as e:
-            logger.error(
-                f"Failed to load native C++ XGBoost model from {model_path}: {e}"
-            )
+            logger.error(f"Failed to load XGBoost model from {model_path}: {e}")
             return None
+
+    @staticmethod
+    def _build_context_features(metrics: list, host_context: dict) -> list:
+        """
+        Constructs the 17-element global context vector appended after the
+        90 per-interval history features. Same layout used by training.
+
+        Slots [0-9]  — node health (10 values):
+          host_cpu%, host_ram%, host_swap%,
+          load_avg_1m, load_avg_5m, ksm_sharing_mb,
+          cpu_overcommit_ratio, ram_overcommit_ratio, container_count, (reserved=0)
+
+        Slots [10-11] — temporal context (2 values):
+          hour_of_day (0-23), day_of_week (0=Mon...6=Sun)
+
+        Slots [12-17] — rate-of-change deltas (6 values):
+          delta_cpu%, delta_mem_mb, delta_diskread, delta_diskwrite,
+          delta_netin, delta_netout
+          (last interval − first interval in the 15-point window)
+        """
+        now = datetime.datetime.now()  # pylint: disable=disallowed-name
+
+        # Rate-of-change deltas across the window
+        first, last = metrics[0], metrics[-1]
+        delta_cpu = (last.get("cpu", 0.0) - first.get("cpu", 0.0)) * 100
+        delta_mem = (last.get("mem", 0.0) - first.get("mem", 0.0)) / (1024 * 1024)
+        delta_dr = last.get("diskread", 0.0) - first.get("diskread", 0.0)
+        delta_dw = last.get("diskwrite", 0.0) - first.get("diskwrite", 0.0)
+        delta_ni = last.get("netin", 0.0) - first.get("netin", 0.0)
+        delta_no = last.get("netout", 0.0) - first.get("netout", 0.0)
+
+        return [
+            # Node health (10)
+            float(host_context.get("cpu_percent", 0.0)),
+            float(host_context.get("ram_percent", 0.0)),
+            float(host_context.get("swap_percent", 0.0)),
+            float(host_context.get("load_avg_1m", 0.0)),
+            float(host_context.get("load_avg_5m", 0.0)),
+            float(host_context.get("ksm_sharing_mb", 0.0)),
+            float(host_context.get("cpu_overcommit_ratio", 0.0)),
+            float(host_context.get("ram_overcommit_ratio", 0.0)),
+            float(host_context.get("container_count", 0.0)),
+            0.0,  # reserved for future use
+            # Temporal (2)
+            float(now.hour),
+            float(now.weekday()),
+            # Rate-of-change deltas (6)
+            delta_cpu,
+            delta_mem,
+            delta_dr,
+            delta_dw,
+            delta_ni,
+            delta_no,
+        ]
 
     def predict_next_usage(
         self,
@@ -68,21 +113,24 @@ class Predictor:
         """
         Takes chronological data from Proxmox RRD API.
         Only performs fast inference using pre-trained XGBoost weights.
-        If no weights exist yet (first day), falls back to the latest telemetry reading safely.
+        If no weights exist yet (first day), falls back to the latest telemetry reading.
 
-        Feature vector layout:
-          Per-container: cpu_percent, mem_mb, disk_read_bps, disk_write_bps,
-                         net_in_bps, net_out_bps — 6 features × 15 intervals = 90 cols
-          Host context:  host_cpu_percent, host_ram_percent, host_swap_percent — 3 cols
-          Total:         93 features
+        Feature vector layout (107 total):
+          [0–89]   Per-container history:  6 × 15 intervals
+                   cpu%, mem_mb, diskread, diskwrite, netin, netout
+          [90–99]  Node health context:    10 scalars
+                   host_cpu%, host_ram%, host_swap%, load_1m, load_5m,
+                   ksm_mb, cpu_overcommit, ram_overcommit, container_count, reserved
+          [100–101] Temporal:             2 scalars (hour_of_day, day_of_week)
+          [101–106] Deltas:               6 scalars (last − first of window)
 
-        host_context dict keys (all optional, default 0.0):
-          cpu_percent, ram_percent, swap_percent
+        host_context keys (all optional, default 0.0):
+          cpu_percent, ram_percent, swap_percent, load_avg_1m, load_avg_5m,
+          ksm_sharing_mb, cpu_overcommit_ratio, ram_overcommit_ratio, container_count
         """
         if host_context is None:
             host_context = {}
 
-        # Filter out invalid or purely null/0 data points that might appear in RRD
         valid_metrics = [
             m for m in rrd_data if m.get("cpu") is not None and m.get("mem") is not None
         ]
@@ -94,26 +142,17 @@ class Predictor:
             )
             return None
 
-        # We want the most recent 15 valid data points for a smooth, fast trend
         metrics = valid_metrics[-15:]
 
-        # Capture peaks before destroying the array
+        # Capture peaks
         highest_recent_cpu = float(max(m.get("cpu", 0.0) * 100 for m in metrics))
-        highest_recent_ram = float(
-            max(m.get("mem", 0.0) / (1024 * 1024) for m in metrics)
-        )
-        # Swap is present in LXC RRD data; absent for VMs (default 0)
-        highest_recent_swap = float(
-            max(m.get("swap", 0.0) / (1024 * 1024) for m in metrics)
-        )
-        # I/O rate peaks — default 0.0 if the field is absent (older RRD data)
+        highest_recent_ram = float(max(m.get("mem", 0.0) / (1024 * 1024) for m in metrics))
+        highest_recent_swap = float(max(m.get("swap", 0.0) / (1024 * 1024) for m in metrics))
         highest_recent_disk_read = float(max(m.get("diskread", 0.0) for m in metrics))
         highest_recent_disk_write = float(max(m.get("diskwrite", 0.0) for m in metrics))
         highest_recent_net_in = float(max(m.get("netin", 0.0) for m in metrics))
         highest_recent_net_out = float(max(m.get("netout", 0.0) for m in metrics))
 
-        # Explicit memory optimization: We no longer need the heavy original RRD json array
-        # or the large filtered array. Free them before we spin up Scikit-Learn matrices.
         del rrd_data
         del valid_metrics
 
@@ -122,7 +161,6 @@ class Predictor:
         fallback_ram = latest.get("mem", 0.0) / (1024 * 1024)
 
         if len(metrics) < 15:
-            # Not enough data for the rigid XGBoost feature array, fallback
             fallback_swap = latest.get("swap", 0.0) / (1024 * 1024)
             del metrics
             return {
@@ -138,7 +176,6 @@ class Predictor:
                 "recent_peak_net_out": highest_recent_net_out,
             }
 
-        # Try to load models
         prefix = entity_type.lower()
         cpu_model_path = os.path.join(self.models_dir, f"{prefix}_{entity_id}_cpu.json")
         ram_model_path = os.path.join(self.models_dir, f"{prefix}_{entity_id}_ram.json")
@@ -149,9 +186,7 @@ class Predictor:
 
         if os.path.exists(cpu_model_path) and os.path.exists(ram_model_path):
             try:
-                # Build per-container feature window: 6 features × 15 intervals = 90 cols.
-                # Feature order must match train_models.py exactly:
-                #   cpu_percent, mem_mb, disk_read_bps, disk_write_bps, net_in_bps, net_out_bps
+                # 90 per-interval features (6 × 15)
                 X_features = []
                 for m in metrics:
                     X_features.append(m.get("cpu", 0.0) * 100)
@@ -161,24 +196,17 @@ class Predictor:
                     X_features.append(m.get("netin", 0.0))
                     X_features.append(m.get("netout", 0.0))
 
-                # Append host context (3 cols): host_cpu_percent, host_ram_percent, host_swap_percent.
-                # Default to 0.0 so inference is backward-compatible with models that lack them.
-                X_features.append(float(host_context.get("cpu_percent", 0.0)))
-                X_features.append(float(host_context.get("ram_percent", 0.0)))
-                X_features.append(float(host_context.get("swap_percent", 0.0)))
+                # 17 global context features (node health + temporal + deltas)
+                X_features.extend(self._build_context_features(metrics, host_context))
 
-                # Retrieve from lightning RAM cache instead of Disk Load
                 model_cpu = self._get_model(cpu_model_path)
                 model_ram = self._get_model(ram_model_path)
 
                 if model_cpu and model_ram:
-                    # Native XGBoost Booster uses DMatrix instead of raw numpy lists directly
                     dmatrix = xgb.DMatrix(np.array([X_features]))
-
                     pred_cpu = max(0.0, float(model_cpu.predict(dmatrix)[0]))
                     pred_ram = max(0.0, float(model_ram.predict(dmatrix)[0]))
 
-                    # Swap model is optional (only exists if LXC has used swap historically)
                     swap_model_path = os.path.join(
                         self.models_dir, f"{prefix}_{entity_id}_swap.json"
                     )
@@ -195,7 +223,6 @@ class Predictor:
                 f"No XGBoost models found yet for {entity_type} {entity_id}. Falling back to live metrics."
             )
 
-        # Explicit memory optimization
         del metrics
 
         return {

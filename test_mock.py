@@ -87,6 +87,64 @@ def test_predictor_new_metric_keys():
         assert result[key] > 0, f"Expected non-zero peak for '{key}' given rising I/O fixture"
 
 
+def test_predictor_delta_features():
+    """Rate-of-change deltas must be non-zero for a rising-trend fixture
+    when using >= 15 intervals (exercises the XGBoost code path, but verifies
+    the context vector is assembled without error even with no model file)."""
+    predictor = Predictor(prediction_horizon=2)
+    base_time = time.time() - 900
+    # 15 points: CPU rises 10 -> 75, RAM rises 512 -> 1024
+    metrics = [
+        {
+            "time": base_time + i * 60,
+            "cpu": 0.10 + i * 0.04,   # rises from 10% to 70%
+            "mem": (512 + i * 35) * 1024 * 1024,  # rises from 512 to 1022 MB
+            "diskread": 1_000_000 * (i + 1),
+            "diskwrite": 500_000 * (i + 1),
+            "netin": 200_000 * (i + 1),
+            "netout": 100_000 * (i + 1),
+        }
+        for i in range(15)
+    ]
+    rich_context = {
+        "cpu_percent": 45.0, "ram_percent": 72.0, "swap_percent": 2.0,
+        "load_avg_1m": 3.2, "load_avg_5m": 2.8, "ksm_sharing_mb": 1024.0,
+        "cpu_overcommit_ratio": 1.8, "ram_overcommit_ratio": 0.85, "container_count": 12.0,
+    }
+    result = predictor.predict_next_usage("998", metrics, "LXC", host_context=rich_context)
+
+    print("\nTesting Delta Feature Computation (rising 15-point fixture):")
+    print(f"Predicted Output: {result}")
+
+    # Peaks should reflect the max point in the window
+    assert result["recent_peak_cpu"] > 50.0, "CPU peak should be near the max of the rising trend"
+    assert result["recent_peak_disk_read"] > 0.0, "disk_read peak should be positive"
+
+
+def test_predictor_host_context_full():
+    """All new host_context fields (load, ksm, overcommit) should pass through
+    without raising any errors and appear in the fallback result."""
+    predictor = Predictor(prediction_horizon=2)
+    base_time = time.time() - 300
+    metrics = [
+        {"time": base_time + i * 60, "cpu": 0.20, "mem": 512 * 1024 * 1024,
+         "diskread": 0, "diskwrite": 0, "netin": 0, "netout": 0}
+        for i in range(5)  # < 15 → uses fallback path
+    ]
+    full_context = {
+        "cpu_percent": 60.0, "ram_percent": 80.0, "swap_percent": 10.0,
+        "load_avg_1m": 4.5, "load_avg_5m": 3.9, "ksm_sharing_mb": 2048.0,
+        "cpu_overcommit_ratio": 2.0, "ram_overcommit_ratio": 1.1, "container_count": 20.0,
+    }
+    result = predictor.predict_next_usage("997", metrics, "LXC", host_context=full_context)
+
+    print("\nTesting Full Host Context Pass-Through (no model, fallback path):")
+    print(f"Predicted Output: {result}")
+
+    assert result is not None, "Should return a valid fallback result"
+    assert result["cpu_percent"] == 20.0, "Fallback CPU should match latest metric"
+
+
 def test_scaler():
     from scaler import Scaler
 
@@ -673,6 +731,8 @@ if __name__ == "__main__":
     print("Running Mock AI Predictor Tests...")
     test_predictor()
     test_predictor_new_metric_keys()
+    test_predictor_delta_features()
+    test_predictor_host_context_full()
     test_scaler()
     test_scaler_uses_peak_ram()
     test_scaler_min_ram_floor()

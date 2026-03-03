@@ -1,3 +1,4 @@
+import datetime
 import os
 import logging
 import sqlite3
@@ -82,6 +83,21 @@ def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
             "swap_pct": float(n.get("swapused", 0.0) / swap_total * 100),
         }
 
+    # Compute cluster overcommit once at training start (one extra API call).
+    # Live-only fields (load_avg, ksm) remain 0.0 in training — the model will start
+    # weighting them once they accumulate in prediction_logs from live cycles.
+    all_lxc = px_client.get_all_lxc_metrics()
+    all_vm = px_client.get_all_vm_metrics()
+    all_containers = {**all_lxc, **all_vm}
+    host_info = px_client.get_host_usage()
+    physical_cpus = max(host_info.get("physical_cpus", 1), 1)
+    total_ram_mb = max(host_info.get("total_ram_mb", 1.0), 1.0)
+    total_alloc_cpus = sum(m.get("allocated_cpus", 0) for m in all_containers.values())
+    total_alloc_ram = sum(m.get("allocated_ram_mb", 0.0) for m in all_containers.values())
+    cpu_overcommit = total_alloc_cpus / physical_cpus
+    ram_overcommit = total_alloc_ram / total_ram_mb
+    container_count = float(len(all_containers))
+
     valid_metrics = [
         m
         for m in rrd_data
@@ -121,17 +137,37 @@ def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
             features.append(m.get("netin", 0.0))
             features.append(m.get("netout", 0.0))
 
-        # Append host context at the timestamp of the latest point in the window (3 cols).
-        # Falls back to zeros when node RRD has a gap at this timestamp.
+        # Append 17 global context features to match the predictor layout exactly.
+        # Feature order MUST stay in sync with Predictor._build_context_features().
         window_ts = past_window[-1].get("time", 0)
         host_snap = node_context_by_time.get(
             window_ts,
             # try nearest minute bucket (node RRD may be rounded differently)
             node_context_by_time.get(window_ts - (window_ts % 60), {}),
         )
+        # [90-99] Node health (10 values)
         features.append(host_snap.get("cpu_pct", 0.0))
         features.append(host_snap.get("ram_pct", 0.0))
         features.append(host_snap.get("swap_pct", 0.0))
+        features.append(0.0)  # load_avg_1m — not in RRD; populated at inference time
+        features.append(0.0)  # load_avg_5m — not in RRD; populated at inference time
+        features.append(0.0)  # ksm_sharing_mb — not in RRD; populated at inference time
+        features.append(cpu_overcommit)  # cluster CPU overcommit ratio
+        features.append(ram_overcommit)  # cluster RAM overcommit ratio
+        features.append(container_count)  # number of running containers
+        features.append(0.0)  # reserved
+        # [100-101] Temporal context (2 values)
+        window_dt = datetime.datetime.fromtimestamp(window_ts) if window_ts else datetime.datetime.now()
+        features.append(float(window_dt.hour))     # hour_of_day
+        features.append(float(window_dt.weekday())) # day_of_week
+        # [101-106] Rate-of-change deltas (6 values: last - first of window)
+        first, last = past_window[0], past_window[-1]
+        features.append((last.get("cpu", 0.0) - first.get("cpu", 0.0)) * 100)
+        features.append((last.get("mem", 0.0) - first.get("mem", 0.0)) / (1024 * 1024))
+        features.append(last.get("diskread", 0.0) - first.get("diskread", 0.0))
+        features.append(last.get("diskwrite", 0.0) - first.get("diskwrite", 0.0))
+        features.append(last.get("netin", 0.0) - first.get("netin", 0.0))
+        features.append(last.get("netout", 0.0) - first.get("netout", 0.0))
 
         X_matrix.append(features)
         y_cpu.append(target.get("cpu", 0.0) * 100)
