@@ -66,6 +66,22 @@ def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
     else:
         rrd_data = px_client.get_vm_rrd_history(entity_id, timeframe=timeframe)
 
+    # Fetch node-level RRD for the same timeframe to provide host context features.
+    # Build a {unix_time: {cpu%, ram%, swap%}} lookup keyed to the nearest minute.
+    node_rrd = px_client.get_node_rrd_history(timeframe=timeframe)
+    node_context_by_time = {}
+    for n in node_rrd:
+        ts = n.get("time", 0)
+        if ts == 0:
+            continue
+        mem_total = n.get("memtotal", 0) or 1  # avoid division by zero
+        swap_total = n.get("swaptotal", 0) or 1
+        node_context_by_time[ts] = {
+            "cpu_pct": float(n.get("cpu", 0.0) * 100),
+            "ram_pct": float(n.get("memused", 0.0) / mem_total * 100),
+            "swap_pct": float(n.get("swapused", 0.0) / swap_total * 100),
+        }
+
     valid_metrics = [
         m
         for m in rrd_data
@@ -104,6 +120,18 @@ def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
             features.append(m.get("diskwrite", 0.0))
             features.append(m.get("netin", 0.0))
             features.append(m.get("netout", 0.0))
+
+        # Append host context at the timestamp of the latest point in the window (3 cols).
+        # Falls back to zeros when node RRD has a gap at this timestamp.
+        window_ts = past_window[-1].get("time", 0)
+        host_snap = node_context_by_time.get(
+            window_ts,
+            # try nearest minute bucket (node RRD may be rounded differently)
+            node_context_by_time.get(window_ts - (window_ts % 60), {}),
+        )
+        features.append(host_snap.get("cpu_pct", 0.0))
+        features.append(host_snap.get("ram_pct", 0.0))
+        features.append(host_snap.get("swap_pct", 0.0))
 
         X_matrix.append(features)
         y_cpu.append(target.get("cpu", 0.0) * 100)

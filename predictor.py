@@ -2,7 +2,7 @@ import numpy as np
 import xgboost as xgb
 import logging
 import os
-from typing import List
+from typing import List, Optional
 
 logger = logging.getLogger("predictor")
 
@@ -59,16 +59,29 @@ class Predictor:
             return None
 
     def predict_next_usage(
-        self, entity_id: str, rrd_data: List[dict], entity_type: str = "LXC"
+        self,
+        entity_id: str,
+        rrd_data: List[dict],
+        entity_type: str = "LXC",
+        host_context: Optional[dict] = None,
     ) -> dict:
         """
         Takes chronological data from Proxmox RRD API.
         Only performs fast inference using pre-trained XGBoost weights.
         If no weights exist yet (first day), falls back to the latest telemetry reading safely.
 
-        Feature vector per interval (6 features × 15 intervals = 90 total):
-          [cpu_percent, mem_mb, disk_read_bps, disk_write_bps, net_in_bps, net_out_bps]
+        Feature vector layout:
+          Per-container: cpu_percent, mem_mb, disk_read_bps, disk_write_bps,
+                         net_in_bps, net_out_bps — 6 features × 15 intervals = 90 cols
+          Host context:  host_cpu_percent, host_ram_percent, host_swap_percent — 3 cols
+          Total:         93 features
+
+        host_context dict keys (all optional, default 0.0):
+          cpu_percent, ram_percent, swap_percent
         """
+        if host_context is None:
+            host_context = {}
+
         # Filter out invalid or purely null/0 data points that might appear in RRD
         valid_metrics = [
             m for m in rrd_data if m.get("cpu") is not None and m.get("mem") is not None
@@ -76,7 +89,8 @@ class Predictor:
 
         if not valid_metrics:
             logger.warning(
-                f"No valid telemetry data received for {entity_type} {entity_id}. Aborting prediction to prevent dangerous scale-down."
+                f"No valid telemetry data received for {entity_type} {entity_id}. "
+                "Aborting prediction to prevent dangerous scale-down."
             )
             return None
 
@@ -135,8 +149,8 @@ class Predictor:
 
         if os.path.exists(cpu_model_path) and os.path.exists(ram_model_path):
             try:
-                # Build feature vector: 6 features × 15 intervals = 90 columns.
-                # Feature order matches train_models.py exactly:
+                # Build per-container feature window: 6 features × 15 intervals = 90 cols.
+                # Feature order must match train_models.py exactly:
                 #   cpu_percent, mem_mb, disk_read_bps, disk_write_bps, net_in_bps, net_out_bps
                 X_features = []
                 for m in metrics:
@@ -146,6 +160,12 @@ class Predictor:
                     X_features.append(m.get("diskwrite", 0.0))
                     X_features.append(m.get("netin", 0.0))
                     X_features.append(m.get("netout", 0.0))
+
+                # Append host context (3 cols): host_cpu_percent, host_ram_percent, host_swap_percent.
+                # Default to 0.0 so inference is backward-compatible with models that lack them.
+                X_features.append(float(host_context.get("cpu_percent", 0.0)))
+                X_features.append(float(host_context.get("ram_percent", 0.0)))
+                X_features.append(float(host_context.get("swap_percent", 0.0)))
 
                 # Retrieve from lightning RAM cache instead of Disk Load
                 model_cpu = self._get_model(cpu_model_path)

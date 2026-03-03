@@ -71,7 +71,8 @@ def test_predictor_new_metric_keys():
         for i in range(5)
     ]
 
-    result = predictor.predict_next_usage("999", metrics, "LXC")
+    result = predictor.predict_next_usage("999", metrics, "LXC",
+                                          host_context={"cpu_percent": 45.0, "ram_percent": 72.0, "swap_percent": 5.0})
 
     print("\nTesting New I/O Peak Keys Present in Predictor Output:")
     print(f"Predicted Output: {result}")
@@ -108,6 +109,7 @@ def test_scaler():
     current_metrics = {
         "allocated_cpus": 2,
         "allocated_ram_mb": 2048.0,
+        "ram_usage_mb": 1800.0,  # 88% of allocation — above 50% idle threshold so active scale-down doesn't fire
         "cpu_percent": 80.0,
         "allocated_swap_mb": 256.0,
     }
@@ -517,6 +519,116 @@ def test_scaler_swap_cap_corrected_without_ram_change():
     )
 
 
+def test_scaler_host_pressure_active_scaledown():
+    """When host RAM > 90% and container is using < 50% of its allocation,
+    the scaler must actively push the container's RAM down to reclaim host headroom."""
+    from scaler import Scaler
+    import scaler as scaler_mod
+
+    original_threshold = scaler_mod.HOST_RAM_ACTIVE_SCALEDOWN_THRESHOLD
+    scaler_mod.HOST_RAM_ACTIVE_SCALEDOWN_THRESHOLD = 90.0
+
+    class MockProxmoxClient:
+        def __init__(self):
+            self.last_update = None
+
+        def get_host_usage(self):
+            # Host RAM at 92% — above the 90% active scale-down threshold
+            return {"cpu_percent": 40.0, "ram_percent": 92.0, "swap_percent": 5.0, "total_ram_mb": 64000}
+
+        def update_lxc_resources(self, _lxc_id, cpus, ram_mb, swap_mb=0):
+            self.last_update = {"cpus": cpus, "ram_mb": ram_mb, "swap_mb": swap_mb}
+
+    px = MockProxmoxClient()
+    scaler = Scaler(px)
+
+    # Container: 2048 MB allocated, only 400 MB used (19.5% — well below 50% idle threshold)
+    # Expected: scaled down to max(int(400 * 1.5), min_ram_mb=512) = max(600, 512) = 600 MB
+    baseline = {"min_cpus": 2, "max_cpus": 2, "min_ram_mb": 512.0, "max_ram_mb": 4096.0}
+    predicted = {
+        "cpu_percent": 10.0,
+        "ram_usage_mb": 400.0,
+        "recent_peak_cpu": 12.0,
+        "recent_peak_ram": 420.0,
+    }
+    current_metrics = {
+        "allocated_cpus": 2,
+        "allocated_ram_mb": 2048.0,
+        "ram_usage_mb": 400.0,
+        "cpu_percent": 10.0,
+    }
+
+    scaler.evaluate_and_scale("400", "LXC", baseline, predicted, current_metrics)
+    scaler_mod.HOST_RAM_ACTIVE_SCALEDOWN_THRESHOLD = original_threshold
+
+    print("\nTesting Host Pressure Active Scale-Down (Host 92% RAM, container 400/2048 MB used):")
+    print(f"Update Requested: {px.last_update}")
+
+    assert px.last_update is not None, "Scaler should have issued an update to reclaim RAM"
+    assert px.last_update["ram_mb"] <= 650, (
+        f"Expected active scale-down to ~600 MB (400*1.5), got {px.last_update['ram_mb']}"
+    )
+    assert px.last_update["ram_mb"] >= 512, (
+        f"RAM must not go below min_ram_mb=512, got {px.last_update['ram_mb']}"
+    )
+
+
+def test_scaler_host_pressure_busy_container_protected():
+    """When host RAM > 90% but the container is actively using > 50% of its allocation,
+    the active scale-down must NOT fire — a busy container is protected."""
+    from scaler import Scaler
+    import scaler as scaler_mod
+
+    original_threshold = scaler_mod.HOST_RAM_ACTIVE_SCALEDOWN_THRESHOLD
+    scaler_mod.HOST_RAM_ACTIVE_SCALEDOWN_THRESHOLD = 90.0
+
+    class MockProxmoxClient:
+        def __init__(self):
+            self.last_update = None
+
+        def get_host_usage(self):
+            return {"cpu_percent": 40.0, "ram_percent": 92.0, "swap_percent": 5.0, "total_ram_mb": 64000}
+
+        def update_lxc_resources(self, _lxc_id, cpus, ram_mb, swap_mb=0):
+            self.last_update = {"cpus": cpus, "ram_mb": ram_mb, "swap_mb": swap_mb}
+
+    px = MockProxmoxClient()
+    scaler = Scaler(px)
+
+    # Container: 2048 MB allocated, 1800 MB used (87.9% — above 50% threshold)
+    # No scale-up needed either (predicted low). Result: no meaningful change -> no API call.
+    baseline = {"min_cpus": 2, "max_cpus": 2, "min_ram_mb": 2048.0, "max_ram_mb": 4096.0}
+    predicted = {
+        "cpu_percent": 10.0,
+        "ram_usage_mb": 1800.0,
+        "recent_peak_cpu": 12.0,
+        "recent_peak_ram": 1850.0,
+    }
+    current_metrics = {
+        "allocated_cpus": 2,
+        "allocated_ram_mb": 2048.0,
+        "ram_usage_mb": 1800.0,
+        "cpu_percent": 10.0,
+        # Set swap to LXC_MIN_SWAP_MB so the swap diff is zero and
+        # the test exclusively validates the active scale-down guard.
+        "allocated_swap_mb": 256.0,
+        "swap_mb": 0.0,
+    }
+
+    scaler.evaluate_and_scale("401", "LXC", baseline, predicted, current_metrics)
+    scaler_mod.HOST_RAM_ACTIVE_SCALEDOWN_THRESHOLD = original_threshold
+
+    print("\nTesting Busy Container Protected from Host Pressure Scale-Down (1800/2048 MB used):")
+    print(f"Update Requested: {px.last_update}")
+
+    # The container is busy; active scale-down must not fire.
+    # desired RAM = 1850 * 1.30 = 2405 -> blocked by host RAM 92% cap -> stays at 2048.
+    # No cpu/ram/swap diff -> no API call.
+    assert px.last_update is None, (
+        "Busy container must NOT be scaled down even when host RAM is critically high"
+    )
+
+
 def test_scaler_host_swap_safety_cap():
     """Scaler must refuse to scale UP CPU or RAM when host swap usage exceeds MAX_HOST_SWAP_USAGE_PERCENT."""
     from scaler import Scaler
@@ -569,5 +681,7 @@ if __name__ == "__main__":
     test_scaler_dynamic_swap_sizing()
     test_scaler_safe_flush_guard()
     test_scaler_swap_cap_corrected_without_ram_change()
+    test_scaler_host_pressure_active_scaledown()
+    test_scaler_host_pressure_busy_container_protected()
     test_scaler_host_swap_safety_cap()
     print("All mock tests passed!")

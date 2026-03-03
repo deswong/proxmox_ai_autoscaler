@@ -251,6 +251,23 @@ class ProxmoxClient:
             logger.error(f"Failed to fetch RRD history for VM {vm_id}: {e}")
             return []
 
+    def get_node_rrd_history(self, timeframe: str = "hour") -> list:
+        """
+        Fetches the RRD historical graph data for the host node itself.
+        Returns a list of dicts with keys: time, cpu, memtotal, memused,
+        swaptotal, swapused — used by the trainer to correlate host pressure
+        with each container's training window.
+        """
+        if not self.proxmox:
+            return []
+
+        try:
+            rrd_data = self.node.rrddata.get(timeframe=timeframe)
+            return rrd_data
+        except Exception as e:
+            logger.error(f"Failed to fetch RRD history for host node: {e}")
+            return []
+
     def get_all_vm_ids(self) -> list:
         """
         Returns a list of all VM IDs on the node, regardless of running status.

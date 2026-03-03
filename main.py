@@ -56,6 +56,9 @@ def run():
                 "No running LXCs or VMs found on this node. Nothing to monitor."
             )
 
+        # 3b. Fetch host node metrics once per cycle — used as ML context AND safety caps
+        host_metrics = px_client.get_host_usage()
+
         # 4. Evaluate each discovered LXC
         for lxc_id, current_metrics in all_lxc_metrics.items():
             if lxc_id in EXCLUDED_LXCS:
@@ -110,9 +113,10 @@ def run():
                     lxc_id, timeframe="hour"
                 )
 
-                # Predict impending usage
+                # Predict impending usage (pass live host metrics as ML context)
                 predicted_usage = predictor.predict_next_usage(
-                    lxc_id, historical_metrics, entity_type="LXC"
+                    lxc_id, historical_metrics, entity_type="LXC",
+                    host_context=host_metrics,
                 )
 
                 if predicted_usage is None:
@@ -198,9 +202,10 @@ def run():
                     vm_id, timeframe="hour"
                 )
 
-                # Predict impending usage
+                # Predict impending usage (pass live host metrics as ML context)
                 predicted_usage = predictor.predict_next_usage(
-                    vm_id, historical_metrics, entity_type="VM"
+                    vm_id, historical_metrics, entity_type="VM",
+                    host_context=host_metrics,
                 )
 
                 if predicted_usage is None:

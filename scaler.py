@@ -11,6 +11,13 @@ from proxmox_api import ProxmoxClient
 
 logger = logging.getLogger("scaler")
 
+# Host RAM % above which we actively push idle containers down to reclaim headroom.
+HOST_RAM_ACTIVE_SCALEDOWN_THRESHOLD = 90.0
+# A container is "idle relative to allocation" when it uses less than this fraction.
+CONTAINER_IDLE_ALLOCATION_RATIO = 0.5
+# Target: scale idle containers to this multiple of current usage (+ 30% buffer).
+ACTIVE_SCALEDOWN_HEADROOM_RATIO = 1.5
+
 
 class Scaler:
     def __init__(self, proxmox_client: ProxmoxClient):
@@ -32,6 +39,11 @@ class Scaler:
         """
         Evaluates predictions against max/min baselines and overall node health.
         Triggers a scaling action if requirements change.
+
+        Host pressure is handled at three tiers:
+          < threshold     — normal operation
+          threshold–90%   — block scale-ups (existing safety cap)
+          > 90% RAM       — block scale-ups AND actively scale down idle containers
         """
 
         if not current_metrics:
@@ -109,42 +121,75 @@ class Scaler:
         safe_ram_limit = min(MAX_HOST_RAM_ALLOCATION_PERCENT, 95.0)
         safe_swap_limit = min(MAX_HOST_SWAP_USAGE_PERCENT, 95.0)
 
+        host_ram_pct = host_metrics.get("ram_percent", 0.0)
+        host_cpu_pct = host_metrics["cpu_percent"]
+        host_swap_pct = host_metrics.get("swap_percent", 0.0)
+
         # Apply Host Swap Safety Cap
         # If the host is heavily swapping, completely block all scale-ups to prevent
         # exacerbating an already memory-starved hypervisor.
         if (
-            host_metrics.get("swap_percent", 0.0) > safe_swap_limit
+            host_swap_pct > safe_swap_limit
             and (target_cpus > current_metrics["allocated_cpus"] or target_ram > current_metrics["allocated_ram_mb"])
         ):
             logger.warning(
                 f"[{entity_type} {entity_id}] SAFETY CAP: Cannot scale up. Host Node Swap is over "
-                f"threshold ({host_metrics['swap_percent']:.1f}% > {safe_swap_limit}%)."
+                f"threshold ({host_swap_pct:.1f}% > {safe_swap_limit}%)."
             )
             # Limit scale up to current allocation for both
             target_cpus = min(target_cpus, current_metrics["allocated_cpus"])
             target_ram = min(target_ram, current_metrics["allocated_ram_mb"])
 
         if (
-            host_metrics["cpu_percent"] > safe_cpu_limit
+            host_cpu_pct > safe_cpu_limit
             and target_cpus > current_metrics["allocated_cpus"]
         ):
             logger.warning(
                 f"[{entity_type} {entity_id}] SAFETY CAP: Cannot scale CPU up. Host Node CPU is over "
-                f"threshold ({host_metrics['cpu_percent']:.1f}% > {safe_cpu_limit}%)."
+                f"threshold ({host_cpu_pct:.1f}% > {safe_cpu_limit}%)."
             )
             # Limit scale up to current allocation
             target_cpus = current_metrics["allocated_cpus"]
 
         if (
-            host_metrics["ram_percent"] > safe_ram_limit
+            host_ram_pct > safe_ram_limit
             and target_ram > current_metrics["allocated_ram_mb"]
         ):
             logger.warning(
                 f"[{entity_type} {entity_id}] SAFETY CAP: Cannot scale RAM up. Host Node RAM is over "
-                f"threshold ({host_metrics['ram_percent']:.1f}% > {safe_ram_limit}%)."
+                f"threshold ({host_ram_pct:.1f}% > {safe_ram_limit}%)."
             )
             # But we can allow scaling down RAM, just not UP.
             target_ram = current_metrics["allocated_ram_mb"]
+
+        # 3b. Active scale-down: when the host is critically RAM-stressed AND this
+        #     container is genuinely idle relative to its allocation, reclaim headroom.
+        #     Guard: both conditions must be true simultaneously so a busy container
+        #     during a host-wide load event is never aggressively shrunk.
+        if (
+            entity_type == "LXC"
+            and host_ram_pct > HOST_RAM_ACTIVE_SCALEDOWN_THRESHOLD
+        ):
+            ram_usage = current_metrics.get("ram_usage_mb", 0.0)
+            alloc_ram = current_metrics["allocated_ram_mb"]
+            if (
+                alloc_ram > 0
+                and ram_usage / alloc_ram < CONTAINER_IDLE_ALLOCATION_RATIO
+            ):
+                # Container is using < 50% of its allocation while the host is struggling.
+                # Nudge it down to usage × 1.5, floored at min_ram_mb.
+                reclaimed_target = max(
+                    int(ram_usage * ACTIVE_SCALEDOWN_HEADROOM_RATIO),
+                    baseline["min_ram_mb"],
+                )
+                if reclaimed_target < alloc_ram:
+                    logger.warning(
+                        f"[{entity_type} {entity_id}] HOST PRESSURE RECLAIM: Host RAM at "
+                        f"{host_ram_pct:.1f}% (>{HOST_RAM_ACTIVE_SCALEDOWN_THRESHOLD:.0f}%). "
+                        f"Container idle ({ram_usage:.0f}/{alloc_ram:.0f} MB used). "
+                        f"Actively reducing RAM to {reclaimed_target} MB to ease host pressure."
+                    )
+                    target_ram = reclaimed_target
 
         # 4. Detect swap saturation on LXCs and schedule a post-scale flush.
         #    High swap means the container is IO-bound on disk; flushing it
