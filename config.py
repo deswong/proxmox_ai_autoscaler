@@ -68,6 +68,13 @@ LXC_MIN_SWAP_MB = int(os.getenv("LXC_MIN_SWAP_MB", 256))
 # is sufficient to safely absorb the pages back.
 SWAP_FLUSH_THRESHOLD_PERCENT = float(os.getenv("SWAP_FLUSH_THRESHOLD_PERCENT", 50.0))
 
+# Minimal swap limit to keep the Proxmox UI active (avoids "N/A" status)
+SWAP_DRAIN_MB = int(os.getenv("SWAP_DRAIN_MB", 8))
+
+# Maximum amount of swap to reclaim per cycle (60s) during a flush.
+# Prevents aggressive synchronous kernel reclaim from stalling the container.
+SWAP_STEP_REDUCTION_MB = int(os.getenv("SWAP_STEP_REDUCTION_MB", 128))
+
 # Training Settings
 TRAINING_DAYS_LOOKBACK = int(os.getenv("TRAINING_DAYS_LOOKBACK", 7))
 

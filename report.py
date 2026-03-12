@@ -63,25 +63,39 @@ def print_report(days: int = 1):
 
     # --- Resource savings ---
     print()
-    print("  ┌─ Resource Savings ──────────────────────────────────")
+    print("  ┌─ Resource Savings (Realized - LXC) ─────────────────")
     freed_ram = ev["net_ram_freed_mb"]
     cpu_delta = ev["net_cpu_cores_delta"]
 
     if freed_ram > 0:
-        freed_gb = freed_ram / 1024
-        print(f"  │  Net RAM freed  : {freed_ram:.0f} MB  ({freed_gb:.2f} GB)")
+        print(f"  │  Net RAM freed  : {freed_ram:.0f} MB  ({freed_ram/1024:.2f} GB)")
     elif freed_ram < 0:
-        alloc_gb = -freed_ram / 1024
-        print(f"  │  Net RAM added  : {-freed_ram:.0f} MB  ({alloc_gb:.2f} GB)")
+        print(f"  │  Net RAM added  : {-freed_ram:.0f} MB  ({-freed_ram/1024:.2f} GB)")
     else:
-        print("  │  Net RAM change : 0 MB  (balanced up/down)")
+        print("  │  Net RAM change : 0 MB")
 
     if cpu_delta < 0:
         print(f"  │  Net CPU freed  : {-cpu_delta:.1f} vCPU cores")
     elif cpu_delta > 0:
         print(f"  │  Net CPU added  : +{cpu_delta:.1f} vCPU cores")
     else:
-        print("  │  Net CPU change : 0 cores  (balanced)")
+        print("  │  Net CPU change : 0 cores")
+
+    if ev["vm_pending_count"] > 0:
+        print("  │")
+        print("  ├─ Potential Savings (Pending Reboot - VM) ───────────")
+        p_ram = ev["potential_ram_freed_mb"]
+        p_cpu = ev["potential_cpu_cores_delta"]
+        
+        if p_ram > 0:
+            print(f"  │  Est. RAM freed : {p_ram:.0f} MB  ({p_ram/1024:.2f} GB)")
+        elif p_ram < 0:
+            print(f"  │  Est. RAM added : {-p_ram:.0f} MB  ({-p_ram/1024:.2f} GB)")
+            
+        if p_cpu < 0:
+            print(f"  │  Est. CPU freed : {-p_cpu:.1f} vCPU cores")
+        elif p_cpu > 0:
+            print(f"  │  Est. CPU added : +{p_cpu:.1f} vCPU cores")
 
     # --- Prediction accuracy ---
     print()

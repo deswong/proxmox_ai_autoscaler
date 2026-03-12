@@ -7,6 +7,8 @@ from config import (
     LXC_TARGET_SWAP_MB,
     LXC_MIN_SWAP_MB,
     SWAP_FLUSH_THRESHOLD_PERCENT,
+    SWAP_DRAIN_MB,
+    SWAP_STEP_REDUCTION_MB,
 )
 from proxmox_api import ProxmoxClient
 
@@ -182,11 +184,11 @@ class Scaler:
                     "Will flush swap after scale-up."
                 )
                 flush_swap = True
-            elif swap_alloc == 0 and swap_used > 5.0:
-                # The container's cap is 0, meaning it is actively draining from a prior flush
+            elif swap_alloc <= SWAP_DRAIN_MB and swap_used > (SWAP_DRAIN_MB + 2):
+                # The container's cap is at or below drain limit, meaning it is actively draining
                 logger.info(
                     f"[LXC {entity_id}] Swap is actively draining to RAM "
-                    f"({swap_used:.0f} MB remaining). Pausing swap allocation until clear."
+                    f"({swap_used:.0f} MB remaining). Maintaining drain cap ({swap_alloc:.0f} MB) until clear."
                 )
                 swap_is_draining = True
 
@@ -195,8 +197,14 @@ class Scaler:
         #    floored at LXC_MIN_SWAP_MB so no container is ever left fully swapless
         #    during the model cold-start period.
         if entity_type == "LXC":
-            if swap_is_draining:
-                target_swap = 0  # Keep cap at 0 to allow the kernel to finish moving pages
+            if flush_swap:
+                # Stepped Reduction: don't drop to SWAP_DRAIN_MB immediately if swap_alloc is large.
+                # Reclaim in chunks of SWAP_STEP_REDUCTION_MB to avoid IO storms.
+                current_swap_alloc = current_metrics.get("allocated_swap_mb", 0.0)
+                target_swap = max(SWAP_DRAIN_MB, int(current_swap_alloc - SWAP_STEP_REDUCTION_MB))
+                logger.info(f"[LXC {entity_id}] Flushing swap: reducing cap from {current_swap_alloc:.0f} to {target_swap} MB.")
+            elif swap_is_draining:
+                target_swap = current_metrics.get("allocated_swap_mb", 0.0)  # Maintain current drain cap
             elif LXC_TARGET_SWAP_MB == -1:
                 peak_swap = max(
                     predicted.get("predicted_swap_mb", 0.0),
@@ -207,7 +215,7 @@ class Scaler:
                     LXC_MIN_SWAP_MB,
                 )
             else:
-                target_swap = max(LXC_TARGET_SWAP_MB, 0)
+                target_swap = max(LXC_TARGET_SWAP_MB, SWAP_DRAIN_MB)
         else:
             target_swap = 0  # VMs manage swap internally; we don't set this
 
@@ -319,6 +327,11 @@ class Scaler:
         alloc_cpus   = current_metrics["allocated_cpus"]
         alloc_ram_mb = current_metrics["allocated_ram_mb"]
 
+        # Fetch actual configuration from API to avoid logging changes that are already pending
+        current_config = self.px.get_vm_config(vm_id)
+        config_cpus = current_config.get("cpus", alloc_cpus)
+        config_ram_mb = current_config.get("ram_mb", alloc_ram_mb)
+
         if sample_count > 0:
             # Primary path: real observed peaks from the telemetry log
             peak_ram_mb  = rolling_peaks["peak_ram_mb"]
@@ -353,9 +366,9 @@ class Scaler:
         ) + 1  # +1 ensures at least one core always recommended
         target_cpus = max(baseline["min_cpus"], min(needed_cores, baseline["max_cpus"]))
 
-        # Only write when change is significant (> 5% RAM or CPU core count changes)
-        ram_delta_pct = abs(target_ram - alloc_ram_mb) / max(alloc_ram_mb, 1) * 100
-        cpu_changed   = target_cpus != alloc_cpus
+        # Only write when change is significant compared to existing CONFIG
+        ram_delta_pct = abs(target_ram - config_ram_mb) / max(config_ram_mb, 1) * 100
+        cpu_changed   = target_cpus != config_cpus
 
         if ram_delta_pct < 5.0 and not cpu_changed:
             logger.debug(
@@ -366,8 +379,8 @@ class Scaler:
 
         logger.info(
             f"[VM {vm_id}] PENDING CONFIG (applies on next reboot): "
-            f"{target_cpus} CPUs (was {alloc_cpus}), "
-            f"{target_ram} MB RAM (was {alloc_ram_mb:.0f} MB). "
+            f"{target_cpus} CPUs (was {config_cpus}), "
+            f"{target_ram} MB RAM (was {config_ram_mb:.0f} MB). "
             f"Basis: {source_label} — 14-day peak {peak_ram_mb:.0f} MB / "
             f"{peak_cpu_pct:.1f}% CPU + {self.ram_buffer_percent:.0f}% headroom."
         )

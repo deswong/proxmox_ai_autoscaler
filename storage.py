@@ -196,17 +196,24 @@ def get_performance_summary(days: int = 1) -> dict:
 
     scale_up = scale_down = vm_pending = host_pressure = 0
     net_ram = net_cpu = 0.0
+    potential_ram = potential_cpu = 0.0
+
     for r in rows:
         if r["action"] == "scale_up":
             scale_up += r["cnt"]
+            net_ram += (r["total_ram_delta"] or 0.0)
+            net_cpu += (r["total_cpu_delta"] or 0.0)
         elif r["action"] == "scale_down":
             scale_down += r["cnt"]
+            net_ram += (r["total_ram_delta"] or 0.0)
+            net_cpu += (r["total_cpu_delta"] or 0.0)
         elif r["action"] == "vm_pending_config":
             vm_pending += r["cnt"]
+            potential_ram += (r["total_ram_delta"] or 0.0)
+            potential_cpu += (r["total_cpu_delta"] or 0.0)
+
         if r["trigger"] == "host_pressure":
             host_pressure += r["cnt"]
-        net_ram += (r["total_ram_delta"] or 0.0)
-        net_cpu += (r["total_cpu_delta"] or 0.0)
 
     # --- Prediction accuracy per entity ---
     cursor.execute(
@@ -244,8 +251,10 @@ def get_performance_summary(days: int = 1) -> dict:
             "scale_down_count":   scale_down,
             "vm_pending_count":   vm_pending,
             "host_pressure_count": host_pressure,
-            "net_ram_freed_mb":   round(-net_ram, 1),   # invert: negative delta = freed
+            "net_ram_freed_mb":   round(-net_ram, 1),
             "net_cpu_cores_delta": round(net_cpu, 2),
+            "potential_ram_freed_mb": round(-potential_ram, 1),
+            "potential_cpu_cores_delta": round(potential_cpu, 2),
         },
         "prediction_accuracy": accuracy,
     }

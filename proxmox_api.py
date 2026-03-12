@@ -8,6 +8,7 @@ from config import (
     PROXMOX_TOKEN_ID,
     PROXMOX_TOKEN_SECRET,
     NODE_NAME,
+    SWAP_DRAIN_MB,
 )
 
 # Suppress insecure request warnings if Proxmox uses self-signed certs
@@ -130,8 +131,8 @@ class ProxmoxClient:
             return False
 
         try:
-            self.node.lxc(lxc_id).config.put(swap=0)
-            logger.info(f"[LXC {lxc_id}] Swap flush triggered via API (swap cap dropped to 0).")
+            self.node.lxc(lxc_id).config.put(swap=SWAP_DRAIN_MB)
+            logger.info(f"[LXC {lxc_id}] Swap flush triggered via API (swap cap dropped to {SWAP_DRAIN_MB} MB).")
             return True
         except Exception as exc:  # pylint: disable=broad-except
             logger.error(f"[LXC {lxc_id}] Unexpected error dropping swap cap to flush: {exc}")
@@ -262,6 +263,23 @@ class ProxmoxClient:
                     time.sleep(2**attempt)
                 else:
                     return False
+
+    def get_vm_config(self, vm_id: str) -> dict:
+        """
+        Retrieves the exact configuration (CPU cores, RAM) of a VM.
+        Useful for comparing target vs pending config to avoid logging loops.
+        """
+        if not self.proxmox:
+            return {}
+        try:
+            config = self.node.qemu(vm_id).config.get()
+            return {
+                "cpus": int(config.get("cores", 1)),
+                "ram_mb": int(config.get("memory", 512)),
+            }
+        except Exception as e:
+            logger.error(f"Failed to fetch config for VM {vm_id}: {e}")
+            return {}
 
     def get_vm_rrd_history(self, vm_id: str, timeframe: str = "hour") -> list:
         """
