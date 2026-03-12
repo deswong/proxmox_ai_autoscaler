@@ -119,20 +119,21 @@ class ProxmoxClient:
                 else:
                     return False
 
-    def flush_lxc_swap(self, lxc_id: str) -> bool:
+    def flush_lxc_swap(self, lxc_id: str, target_mb: int = None) -> bool:
         """
-        Flushes active swap for an LXC by dropping its swap cap to 0 via
+        Flushes active swap for an LXC by dropping its swap cap via
         the Proxmox API. This forces the host kernel to reclaim the swap pages
-        into RAM. The autoscaler will automatically restore the normal
-        target swap cap on its next cycle 1 minute later, providing a safe
-        drain window.
+        into RAM.
         """
         if not self.proxmox:
             return False
 
+        if target_mb is None:
+            target_mb = SWAP_DRAIN_MB
+
         try:
-            self.node.lxc(lxc_id).config.put(swap=SWAP_DRAIN_MB)
-            logger.info(f"[LXC {lxc_id}] Swap flush triggered via API (swap cap dropped to {SWAP_DRAIN_MB} MB).")
+            self.node.lxc(lxc_id).config.put(swap=target_mb)
+            logger.info(f"[LXC {lxc_id}] Swap flush triggered via API (swap cap set to {target_mb} MB).")
             return True
         except Exception as exc:  # pylint: disable=broad-except
             logger.error(f"[LXC {lxc_id}] Unexpected error dropping swap cap to flush: {exc}")

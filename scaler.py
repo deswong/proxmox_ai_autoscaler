@@ -353,7 +353,7 @@ class Scaler:
                 except Exception as log_err:
                     logger.debug(f"[LXC {entity_id}] Scale event log failed: {log_err}")
                 if flush_swap:
-                    self.px.flush_lxc_swap(entity_id)
+                    self.px.flush_lxc_swap(entity_id, target_mb=target_swap)
             elif entity_type == "VM":
                 self.px.update_vm_resources(entity_id, target_cpus, target_ram)
         else:
