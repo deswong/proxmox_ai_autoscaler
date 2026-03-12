@@ -23,7 +23,7 @@ Zero database tuning, zero Prometheus stacks — just one service keeping your P
 | **Rich Telemetry Storage** | Every prediction logs 17 environment fields to SQLite (hour, load avg, overcommit, actual usage) powering future training |
 | **Zero-Config Discovery** | No manual container lists required. Dynamic baselines auto-assigned to unknown containers |
 | **Boot Storm Protection** | 15-minute grace period after reboots prevents AI from learning from artificial startup spikes |
-| **Intelligent Swap Management** | ML-driven LXC swap cap sizing with Safe Flush — drops cap to 0 to force the kernel to reclaim pages |
+| **Intelligent Swap Management** | ML-driven LXC swap cap sizing with Stepped Safe Flush — reclaims swap in 128MB steps down to 8MB to prevent IO stalls |
 | **Universal LXC Hotplugging** | Adjusts CPU and RAM live on containers — no restarts required |
 
 ---
@@ -165,6 +165,8 @@ MAX_HOST_SWAP_USAGE_PERCENT=20
 LXC_TARGET_SWAP_MB=-1        # -1 = auto-size from ML peak, 0 = disable swap, N = fixed MB
 LXC_MIN_SWAP_MB=256          # Floor applied in auto mode
 SWAP_FLUSH_THRESHOLD_PERCENT=50  # Flush swap when usage > 50% of cap
+SWAP_DRAIN_MB=8              # Minimal swap limit to avoid 'N/A' in UI
+SWAP_STEP_REDUCTION_MB=128   # Max swap to reclaim per 60s cycle during flush
 ```
 
 ### Per-Container Baselines
@@ -255,9 +257,13 @@ Example output:
   │  Scale-downs    : 30 events
   │  VM pending cfg : 3 updates (apply on next reboot)
 
-  ┌─ Resource Savings ──────────────────────────────────
+  ┌─ Resource Savings (Realized - LXC) ─────────────────
   │  Net RAM freed  : 12288 MB  (12.00 GB)
   │  Net CPU freed  : 8.0 vCPU cores
+  │
+  ├─ Potential Savings (Pending Reboot - VM) ───────────
+  │  Est. RAM freed : 2048 MB  (2.00 GB)
+  │  Est. CPU freed : 4.0 vCPU cores
 
   ┌─ Prediction Accuracy (MAE per entity) ──────────────
   │  Entity        CPU MAE     RAM MAE   Samples
