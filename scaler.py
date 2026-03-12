@@ -232,7 +232,7 @@ class Scaler:
         if (
             target_cpus != current_metrics["allocated_cpus"]
             or ram_diff >= 32
-            or swap_diff >= 32
+            or swap_diff > 0
             or flush_swap
         ):
             cpu_action = "UNCHANGED"
