@@ -221,9 +221,6 @@ def get_performance_summary(days: int = 1) -> dict:
 
         if r["trigger"] == "host_pressure":
             host_pressure += r["cnt"]
-        
-        # Track swap delta for scale events
-        net_swap += (r["swap_before_mb"] - r["swap_after_mb"]) if r["swap_before_mb"] is not None else 0.0
 
     # --- Swap Trend Analysis (Natural Reclaim progress) ---
     # We look at the first and last swap reading in the period to see if usage dropped
