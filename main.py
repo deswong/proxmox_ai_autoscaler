@@ -212,9 +212,9 @@ def run():
                     # scaler never shrinks a VM below its provisioned size.
                     baseline = {
                         "min_cpus": 1,
-                        "min_ram_mb": current_metrics["allocated_ram_mb"],
+                        "min_ram_mb": max(1024, int(current_metrics["allocated_ram_mb"])),
                         "max_cpus": current_metrics["allocated_cpus"] + 4,
-                        "max_ram_mb": current_metrics["allocated_ram_mb"] * 2,
+                        "max_ram_mb": max(1024, int(current_metrics["allocated_ram_mb"] * 2)),
                     }
                     logger.debug(
                         f"[VM {vm_id}] Using dynamic fallback baseline: {baseline}"
