@@ -55,6 +55,17 @@ class Scaler:
             )
             return
 
+        # Fetch live host node metrics early so they are available for all safety guards
+        host_metrics = self.px.get_host_usage()
+        host_ram_pct = host_metrics.get("ram_percent", 0.0)
+        host_cpu_pct = host_metrics["cpu_percent"]
+        host_swap_pct = host_metrics.get("swap_percent", 0.0)
+
+        # Hardcoded emergency safeguards (caps user config at max 95%)
+        safe_cpu_limit = min(MAX_HOST_CPU_ALLOCATION_PERCENT, 95.0)
+        safe_ram_limit = min(MAX_HOST_RAM_ALLOCATION_PERCENT, 95.0)
+        safe_swap_limit = min(MAX_HOST_SWAP_USAGE_PERCENT, 95.0)
+
         # 0. Pre-calculate swap status (Needed for RAM headroom planning)
         flush_swap = False
         swap_is_draining = False
@@ -154,17 +165,7 @@ class Scaler:
                 logger.info(f"[LXC {entity_id}] Target RAM scaling to {target_ram} MB unlocks enough headroom ({target_headroom:.0f} MB) for swap flush.")
 
         # 3. Check physical node limits before scaling UP
-        # Fetch live host node metrics
-        host_metrics = self.px.get_host_usage()
-
         # Hardcoded emergency safeguard (caps user config at max 95%)
-        safe_cpu_limit = min(MAX_HOST_CPU_ALLOCATION_PERCENT, 95.0)
-        safe_ram_limit = min(MAX_HOST_RAM_ALLOCATION_PERCENT, 95.0)
-        safe_swap_limit = min(MAX_HOST_SWAP_USAGE_PERCENT, 95.0)
-
-        host_ram_pct = host_metrics.get("ram_percent", 0.0)
-        host_cpu_pct = host_metrics["cpu_percent"]
-        host_swap_pct = host_metrics.get("swap_percent", 0.0)
 
         # Apply Host Swap Safety Cap
         # If the host is heavily swapping, completely block all scale-ups to prevent
