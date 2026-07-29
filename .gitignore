@@ -10,6 +10,7 @@ venv.bak/
 # SQLite Database
 *.db
 autoscaler.db
+host_logs.txt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

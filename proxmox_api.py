@@ -246,16 +246,32 @@ class ProxmoxClient:
 
     def get_vm_config(self, vm_id: str) -> dict:
         """
-        Retrieves the exact configuration (CPU cores, RAM) of a VM.
-        Useful for comparing target vs pending config to avoid logging loops.
+        Retrieves the exact configuration (CPU cores, RAM) of a VM, checking both active
+        and pending settings to avoid redundant API write loops.
         """
         if not self.proxmox:
             return {}
         try:
             config = self.node.qemu(vm_id).config.get()
+            cpus = int(config.get("cores", 1))
+            ram_mb = int(config.get("memory", 512))
+
+            # Query pending configuration changes if available
+            try:
+                pending_items = self.node.qemu(vm_id).pending.get()
+                for item in pending_items:
+                    key = item.get("key")
+                    if "pending" in item and item["pending"] is not None:
+                        if key == "cores":
+                            cpus = int(item["pending"])
+                        elif key == "memory":
+                            ram_mb = int(item["pending"])
+            except Exception as pending_err:
+                logger.debug(f"[VM {vm_id}] Could not query pending config: {pending_err}")
+
             return {
-                "cpus": int(config.get("cores", 1)),
-                "ram_mb": int(config.get("memory", 512)),
+                "cpus": cpus,
+                "ram_mb": ram_mb,
             }
         except Exception as e:
             logger.error(f"Failed to fetch config for VM {vm_id}: {e}")

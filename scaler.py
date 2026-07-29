@@ -369,8 +369,9 @@ class Scaler:
         target_ram = max(target_ram, baseline["min_ram_mb"])
         target_ram = min(target_ram, baseline["max_ram_mb"])
 
+        base_cpus = max(config_cpus, alloc_cpus)
         needed_cores = int(
-            (peak_cpu_pct / 100.0) * alloc_cpus * (1 + self.cpu_buffer_percent / 100.0)
+            (peak_cpu_pct / 100.0) * base_cpus * (1 + self.cpu_buffer_percent / 100.0)
         ) + 1  # +1 ensures at least one core always recommended
         target_cpus = max(baseline["min_cpus"], min(needed_cores, baseline["max_cpus"]))
 
