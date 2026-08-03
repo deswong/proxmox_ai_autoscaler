@@ -322,6 +322,67 @@ class ProxmoxClient:
             logger.error(f"Failed to fetch VM IDs from node {NODE_NAME}: {e}")
             return []
 
+    def get_all_committed_resources(self) -> dict:
+        """
+        Returns the total CPU cores and RAM *configured* across ALL LXCs and VMs
+        on the node, regardless of whether they are currently running or stopped.
+
+        This represents the worst-case scenario: if every entity were started
+        simultaneously the host would need to service all of these allocations.
+        The autoscaler uses this to ensure it never proposes a scale-up that would
+        make the host unable to start all tenants at once.
+
+        Returns:
+            {
+                "committed_cpus":     int    — sum of configured cores (all entities)
+                "committed_ram_mb":   float  — sum of configured RAM MB (all entities)
+                "total_entity_count": int    — total number of LXCs + VMs (any state)
+                "stopped_entity_count": int  — entities not currently running
+            }
+        """
+        _empty = {
+            "committed_cpus": 0,
+            "committed_ram_mb": 0.0,
+            "total_entity_count": 0,
+            "stopped_entity_count": 0,
+        }
+        if not self.proxmox:
+            return _empty
+
+        total_cpus = 0
+        total_ram_mb = 0.0
+        total_count = 0
+        stopped_count = 0
+
+        try:
+            lxcs = self.node.lxc.get()
+            for lxc in lxcs:
+                total_cpus += int(lxc.get("cpus", 0))
+                total_ram_mb += float(lxc.get("maxmem", 0) / (1024 * 1024))
+                total_count += 1
+                if lxc.get("status") != "running":
+                    stopped_count += 1
+        except Exception as e:
+            logger.error(f"Failed to fetch committed LXC resources: {e}")
+
+        try:
+            vms = self.node.qemu.get()
+            for vm in vms:
+                total_cpus += int(vm.get("cpus", 0))
+                total_ram_mb += float(vm.get("maxmem", 0) / (1024 * 1024))
+                total_count += 1
+                if vm.get("status") != "running":
+                    stopped_count += 1
+        except Exception as e:
+            logger.error(f"Failed to fetch committed VM resources: {e}")
+
+        return {
+            "committed_cpus":       total_cpus,
+            "committed_ram_mb":     total_ram_mb,
+            "total_entity_count":   total_count,
+            "stopped_entity_count": stopped_count,
+        }
+
     def get_all_vm_metrics(self) -> dict:
         """
         Returns a dictionary mapping VM IDs to their parsed current telemetry.

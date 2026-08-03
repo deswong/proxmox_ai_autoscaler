@@ -140,7 +140,7 @@ class Predictor:
 
         metrics = valid_metrics[-15:]
 
-        # Capture peaks
+        # Capture peaks and smoothed averages
         highest_recent_cpu = float(max(m.get("cpu", 0.0) * 100 for m in metrics))
         highest_recent_ram = float(max(m.get("mem", 0.0) / (1024 * 1024) for m in metrics))
         highest_recent_swap = float(max(m.get("swap", 0.0) / (1024 * 1024) for m in metrics))
@@ -148,6 +148,19 @@ class Predictor:
         highest_recent_disk_write = float(max(m.get("diskwrite", 0.0) for m in metrics))
         highest_recent_net_in = float(max(m.get("netin", 0.0) for m in metrics))
         highest_recent_net_out = float(max(m.get("netout", 0.0) for m in metrics))
+
+        # Exponentially-weighted moving average (EWMA) of the last 5 CPU readings.
+        # α=0.3: new readings count for 30%, prior EWMA for 70%.
+        # This dampens transient spikes so a single noisy burst doesn't drive a large scale-up.
+        _ewma_alpha = 0.3
+        _ewma_window = [m.get("cpu", 0.0) * 100 for m in metrics[-5:]]
+        _ewma = _ewma_window[0]
+        for _val in _ewma_window[1:]:
+            _ewma = _ewma_alpha * _val + (1.0 - _ewma_alpha) * _ewma
+        smoothed_cpu_percent = float(_ewma)
+
+        # Simple mean of the window — useful as a steady-state baseline
+        recent_avg_cpu = float(sum(m.get("cpu", 0.0) * 100 for m in metrics) / len(metrics))
 
         del rrd_data
         del valid_metrics
@@ -170,6 +183,8 @@ class Predictor:
                 "recent_peak_disk_write": highest_recent_disk_write,
                 "recent_peak_net_in": highest_recent_net_in,
                 "recent_peak_net_out": highest_recent_net_out,
+                "smoothed_cpu_percent": smoothed_cpu_percent,
+                "recent_avg_cpu": recent_avg_cpu,
             }
 
         prefix = entity_type.lower()
@@ -233,4 +248,6 @@ class Predictor:
             "recent_peak_disk_write": highest_recent_disk_write,
             "recent_peak_net_in": highest_recent_net_in,
             "recent_peak_net_out": highest_recent_net_out,
+            "smoothed_cpu_percent": smoothed_cpu_percent,
+            "recent_avg_cpu": recent_avg_cpu,
         }

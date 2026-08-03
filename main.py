@@ -71,7 +71,27 @@ def run():
         host_metrics["cpu_overcommit_ratio"] = total_alloc_cpus / physical_cpus
         host_metrics["ram_overcommit_ratio"] = total_alloc_ram / total_ram_mb
         host_metrics["container_count"] = float(len(all_containers))
+
+        # 3d. Worst-case committed capacity — includes ALL entities (running + stopped).
+        #     If every stopped VM/LXC were powered on simultaneously, the host must still
+        #     be able to service all their configured allocations. The scaler will refuse
+        #     any scale-up that would push the total committed resources over the physical limit.
+        committed = px_client.get_all_committed_resources()
+        host_metrics["committed_cpus"]       = committed["committed_cpus"]
+        host_metrics["committed_ram_mb"]     = committed["committed_ram_mb"]
+        host_metrics["total_entity_count"]   = committed["total_entity_count"]
+        host_metrics["stopped_entity_count"] = committed["stopped_entity_count"]
+
+        if committed["stopped_entity_count"] > 0:
+            logger.debug(
+                f"Worst-case capacity: {committed['committed_cpus']} CPUs / "
+                f"{committed['committed_ram_mb']:.0f} MB RAM committed across "
+                f"{committed['total_entity_count']} entities "
+                f"({committed['stopped_entity_count']} currently stopped)."
+            )
+
         _now = datetime.datetime.now()
+
 
         # 4. Evaluate each discovered LXC
         for lxc_id, current_metrics in all_lxc_metrics.items():

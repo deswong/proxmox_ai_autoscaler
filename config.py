@@ -63,6 +63,14 @@ LXC_TARGET_SWAP_MB = int(os.getenv("LXC_TARGET_SWAP_MB", -1))
 # completely swapless during the model cold-start period.
 LXC_MIN_SWAP_MB = int(os.getenv("LXC_MIN_SWAP_MB", 256))
 
+# Minimum percentage of total host RAM to always keep free (never allocated to containers).
+# This permanent buffer covers the hypervisor OS itself and absorbs unexpected spikes
+# across all tenants simultaneously. Applies as a hard ceiling on per-container scale-ups.
+# Example: 15% on a 64 GB host reserves ~9.6 GB for the hypervisor at all times.
+HOST_RAM_RESERVE_PERCENT = min(
+    float(os.getenv("HOST_RAM_RESERVE_PERCENT", 15.0)), 50.0
+)
+
 # Flush active swap inside an LXC when its swap usage exceeds this
 # percentage of its current swap cap. Only flushes when RAM headroom
 # is sufficient to safely absorb the pages back.

@@ -482,16 +482,22 @@ def get_prediction_errors(entity_id: str, days: int = 14) -> dict:
 
 def get_vm_rolling_peaks(entity_id: str, days: int = 14) -> dict:
     """
-    Returns the rolling maximum CPU% and RAM usage observed for a VM/LXC over
-    the last ``days`` days from the prediction_logs telemetry table.
+    Returns rolling CPU and RAM statistics observed for a VM/LXC over the last
+    ``days`` days from the prediction_logs telemetry table.
 
     Uses the ``ctx_actual_cpu`` and ``ctx_actual_ram`` columns written by the live
     daemon every cycle, so the peaks reflect what the entity *actually* used —
     not just what the ML model predicted.
 
+    Returns both the raw peak AND smoothed statistics (P95, average) so the VM sizer
+    can blend them — a single spike from 13 days ago won't permanently over-provision
+    the VM until it ages out.
+
     Returns:
         {
             "peak_cpu_pct": float,   # highest observed CPU%  (0 if no data)
+            "avg_cpu_pct":  float,   # mean CPU% over the window
+            "p95_cpu_pct":  float,   # 95th-percentile CPU% (smoothed spike proxy)
             "peak_ram_mb":  float,   # highest observed RAM MB (0 if no data)
             "sample_count": int,     # rows found; 0 means bootstrap from prediction peaks
         }
@@ -499,26 +505,46 @@ def get_vm_rolling_peaks(entity_id: str, days: int = 14) -> dict:
     conn = get_db_connection()
     cursor = conn.cursor()
     cutoff = time.time() - (days * 86400)
+
+    # Fetch all individual CPU readings so we can compute percentiles in Python.
+    # SQLite has no built-in PERCENTILE_CONT, so we pull the raw values.
     cursor.execute(
         """
-        SELECT MAX(ctx_actual_cpu) AS peak_cpu,
-               MAX(ctx_actual_ram) AS peak_ram,
-               COUNT(*)            AS samples
+        SELECT ctx_actual_cpu, ctx_actual_ram
         FROM prediction_logs
         WHERE lxc_id = ? AND timestamp >= ?
+          AND ctx_actual_cpu IS NOT NULL
+          AND ctx_actual_ram IS NOT NULL
+        ORDER BY ctx_actual_cpu
         """,
         (str(entity_id), cutoff),
     )
-    row = cursor.fetchone()
+    rows = cursor.fetchall()
     conn.close()
 
-    if row and row["samples"]:
+    if not rows:
         return {
-            "peak_cpu_pct": float(row["peak_cpu"] or 0.0),
-            "peak_ram_mb":  float(row["peak_ram"] or 0.0),
-            "sample_count": int(row["samples"]),
+            "peak_cpu_pct": 0.0,
+            "avg_cpu_pct":  0.0,
+            "p95_cpu_pct":  0.0,
+            "peak_ram_mb":  0.0,
+            "sample_count": 0,
         }
-    return {"peak_cpu_pct": 0.0, "peak_ram_mb": 0.0, "sample_count": 0}
+
+    cpu_values = [float(r["ctx_actual_cpu"] or 0.0) for r in rows]
+    ram_values = [float(r["ctx_actual_ram"] or 0.0) for r in rows]
+
+    # Rows are already sorted ascending by ctx_actual_cpu (ORDER BY above)
+    n = len(cpu_values)
+    p95_index = max(0, int(n * 0.95) - 1)  # 0-indexed into sorted list
+
+    return {
+        "peak_cpu_pct": float(cpu_values[-1]),                        # max
+        "avg_cpu_pct":  float(sum(cpu_values) / n),                   # mean
+        "p95_cpu_pct":  float(cpu_values[p95_index]),                  # 95th pct
+        "peak_ram_mb":  float(max(ram_values)),
+        "sample_count": n,
+    }
 
 
 def cleanup_prediction_logs(retention_days=14):

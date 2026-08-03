@@ -6,13 +6,15 @@ from config import (
     MAX_HOST_SWAP_USAGE_PERCENT,
     LXC_TARGET_SWAP_MB,
     LXC_MIN_SWAP_MB,
+    HOST_RAM_RESERVE_PERCENT,
 )
 from proxmox_api import ProxmoxClient
 
 logger = logging.getLogger("scaler")
 
 # Host RAM % above which we actively push idle containers down to reclaim headroom.
-HOST_RAM_ACTIVE_SCALEDOWN_THRESHOLD = 90.0
+# Lowered from 90% → 80% so reclaiming starts well before the host is critically stressed.
+HOST_RAM_ACTIVE_SCALEDOWN_THRESHOLD = 80.0
 # A container is "idle relative to allocation" when it uses less than this fraction.
 CONTAINER_IDLE_ALLOCATION_RATIO = 0.5
 # Target: scale idle containers to this multiple of current usage (+ 30% buffer).
@@ -72,11 +74,11 @@ class Scaler:
             swap_alloc = current_metrics.get("allocated_swap_mb", 0.0)
 
         # 1. Calculate the raw desired resources from the predictor.
-        #    Use the higher of the ML forecast, the observed recent peak, or 
+        #    Use the higher of the ML forecast, the observed recent peak, or
         #    the current actual usage to ensure we never under-allocate.
         current_usage_mb = current_metrics.get("ram_usage_mb", 0.0)
         peak_ram_mb = max(
-            predicted["ram_usage_mb"], 
+            predicted["ram_usage_mb"],
             predicted.get("recent_peak_ram", 0.0),
             current_usage_mb
         )
@@ -93,25 +95,51 @@ class Scaler:
                 )
                 peak_ram_mb = needed_for_swap
 
-        desired_ram_mb = peak_ram_mb * (1 + self.ram_buffer_percent / 100.0)
+        # Tapered RAM buffer: the headroom shrinks proportionally as the host approaches its
+        # safety threshold, so we never blindly over-allocate with a flat 30% when RAM is tight.
+        # At 0% host usage → full ram_buffer_percent. At the threshold → min 5%.
+        host_ram_pressure_ratio = min(host_ram_pct / max(safe_ram_limit, 1.0), 1.0)
+        effective_ram_buffer = max(5.0, self.ram_buffer_percent * (1.0 - host_ram_pressure_ratio))
+        if effective_ram_buffer < self.ram_buffer_percent:
+            logger.debug(
+                f"[{entity_type} {entity_id}] Host RAM at {host_ram_pct:.1f}% — tapering "
+                f"RAM buffer from {self.ram_buffer_percent:.0f}% → {effective_ram_buffer:.1f}%."
+            )
+        desired_ram_mb = peak_ram_mb * (1 + effective_ram_buffer / 100.0)
 
-        # CPU scaling heuristic - proportional to the predicted load:
-        # Scale UP: add 1 core for every 15% above the 85% high-water mark
-        # Scale DOWN: drop 1 core for every 30% below the 25% low-water mark
+        # Hard ceiling: we must never allocate more vCPUs than the host physically has.
+        physical_cpus = max(int(host_metrics.get("physical_cpus", 1)), 1)
+
+        # CPU scaling heuristic using a blended signal:
+        #   60% weight to the EWMA-smoothed reading (spike-dampened)
+        #   40% weight to the ML model prediction
+        # This prevents a single-cycle burst from immediately adding cores, while
+        # still responding meaningfully when load is genuinely and persistently high.
+        smoothed_cpu = predicted.get("smoothed_cpu_percent", predicted["cpu_percent"])
+        blended_cpu = 0.6 * smoothed_cpu + 0.4 * predicted["cpu_percent"]
+
         desired_cpus = current_metrics["allocated_cpus"]
-        if predicted["cpu_percent"] > 85.0:
-            overshoot = predicted["cpu_percent"] - 85.0
+        if blended_cpu > 85.0:
+            overshoot = blended_cpu - 85.0
             cores_to_add = max(1, int(overshoot / 15))
             desired_cpus += cores_to_add
-        elif predicted["cpu_percent"] < 25.0 and current_metrics["cpu_percent"] < 25.0:
-            undershoot = 25.0 - predicted["cpu_percent"]
+        elif (
+            blended_cpu < 25.0
+            and smoothed_cpu < 25.0  # EWMA must also agree — prevents scale-down on brief lulls
+            and current_metrics["cpu_percent"] < 25.0  # live reading confirms it's genuinely idle
+        ):
+            undershoot = 25.0 - blended_cpu
             cores_to_remove = max(1, int(undershoot / 30))
             desired_cpus = max(1, desired_cpus - cores_to_remove)
+
+        # Clamp desired_cpus to what the host can physically provide BEFORE applying baselines.
+        desired_cpus = min(desired_cpus, physical_cpus)
 
         logger.info(
             f"[{entity_type} {entity_id}] Analyzing... Current State: "
             f"{current_metrics['allocated_cpus']} Cores, {current_metrics['allocated_ram_mb']} MB RAM. "
-            f"Predicted Need: {desired_cpus} Cores ({predicted['cpu_percent']:.1f}%), "
+            f"Predicted Need: {desired_cpus} Cores "
+            f"(blended CPU: {blended_cpu:.1f}%, smoothed: {smoothed_cpu:.1f}%, raw: {predicted['cpu_percent']:.1f}%), "
             f"{predicted['ram_usage_mb']:.0f} MB RAM."
         )
 
@@ -133,7 +161,13 @@ class Scaler:
             if host_ram_pct < 95.0:
                 target_ram = max(target_ram, int(current_metrics["allocated_ram_mb"]))
 
-        target_cpus = max(baseline["min_cpus"], min(desired_cpus, baseline["max_cpus"]))
+        # Clamp target_cpus: respect baseline bounds AND never exceed physical host CPU count.
+        target_cpus = max(baseline["min_cpus"], min(desired_cpus, baseline["max_cpus"], physical_cpus))
+        if target_cpus < desired_cpus:
+            logger.debug(
+                f"[{entity_type} {entity_id}] CPU clamped to {target_cpus} "
+                f"(physical host limit: {physical_cpus}, baseline max: {baseline['max_cpus']})."
+            )
 
         # 3. Check physical node limits before scaling UP
         # Hardcoded emergency safeguard (caps user config at max 95%)
@@ -174,6 +208,81 @@ class Scaler:
             )
             # But we can allow scaling down RAM, just not UP.
             target_ram = current_metrics["allocated_ram_mb"]
+
+        # Worst-case committed capacity check.
+        # We treat every stopped VM/LXC as a latent demand that could materialise at
+        # any moment. Before approving a scale-up we verify that the proposed new
+        # allocation still leaves the host able to start ALL entities simultaneously.
+        #
+        # committed_cpus / committed_ram_mb come from get_all_committed_resources()
+        # and include stopped entities — this is the key difference from the current
+        # running-only overcommit ratios computed in main.py.
+        total_ram_mb = host_metrics.get("total_ram_mb", 0.0)
+        committed_cpus   = host_metrics.get("committed_cpus", 0)
+        committed_ram_mb = host_metrics.get("committed_ram_mb", 0.0)
+
+        if total_ram_mb > 0 and committed_cpus > 0:
+            # --- CPU worst-case budget ---
+            cpu_delta = target_cpus - current_metrics["allocated_cpus"]
+            if cpu_delta > 0:
+                # Max cores we are willing to commit across ALL entities
+                max_committable_cpus = int(physical_cpus * (safe_cpu_limit / 100.0))
+                projected_committed_cpus = committed_cpus + cpu_delta
+                if projected_committed_cpus > max_committable_cpus:
+                    # Calculate how many cores are actually available in the budget
+                    available_cpu_budget = max(0, max_committable_cpus - committed_cpus)
+                    clamped_cpus = current_metrics["allocated_cpus"] + available_cpu_budget
+                    clamped_cpus = max(baseline["min_cpus"], min(clamped_cpus, target_cpus))
+                    if clamped_cpus < target_cpus:
+                        logger.warning(
+                            f"[{entity_type} {entity_id}] WORST-CASE CPU CAP: "
+                            f"Scaling to {target_cpus} cores would push total committed "
+                            f"to {projected_committed_cpus} (budget: {max_committable_cpus} "
+                            f"of {physical_cpus} physical). Clamping to {clamped_cpus}."
+                        )
+                        target_cpus = clamped_cpus
+
+            # --- RAM worst-case budget ---
+            ram_delta = target_ram - current_metrics["allocated_ram_mb"]
+            if ram_delta > 0:
+                # Max RAM we are willing to commit across ALL entities (reserve stays free)
+                reserved_mb = total_ram_mb * (HOST_RAM_RESERVE_PERCENT / 100.0)
+                max_committable_ram = total_ram_mb - reserved_mb
+                projected_committed_ram = committed_ram_mb + ram_delta
+                if projected_committed_ram > max_committable_ram:
+                    available_ram_budget = max(0.0, max_committable_ram - committed_ram_mb)
+                    ram_ceiling_mb = int(current_metrics["allocated_ram_mb"] + available_ram_budget)
+                    ram_ceiling_mb = max(int(baseline["min_ram_mb"]), min(ram_ceiling_mb, target_ram))
+                    if ram_ceiling_mb < target_ram:
+                        logger.warning(
+                            f"[{entity_type} {entity_id}] WORST-CASE RAM CAP: "
+                            f"Scaling to {target_ram} MB would push total committed "
+                            f"to {projected_committed_ram:.0f} MB "
+                            f"(budget: {max_committable_ram:.0f} MB, "
+                            f"reserve: {reserved_mb:.0f} MB of {total_ram_mb:.0f} MB total). "
+                            f"Clamping to {ram_ceiling_mb} MB."
+                        )
+                        target_ram = ram_ceiling_mb
+        elif total_ram_mb > 0:
+            # Fallback: committed data not yet available — use live free-RAM ceiling
+            # (original guard, kept as a safety net on first cycle before API data arrives)
+            reserved_mb = total_ram_mb * (HOST_RAM_RESERVE_PERCENT / 100.0)
+            host_free_mb = total_ram_mb * (1.0 - host_ram_pct / 100.0)
+            available_for_scale = host_free_mb - reserved_mb
+            ram_delta = target_ram - current_metrics["allocated_ram_mb"]
+            if ram_delta > 0 and available_for_scale <= 0:
+                logger.warning(
+                    f"[{entity_type} {entity_id}] AVAILABLE-RAM CAP: No headroom left after "
+                    f"{HOST_RAM_RESERVE_PERCENT:.0f}% reserve ({reserved_mb:.0f} MB). "
+                    "Blocking scale-up."
+                )
+                target_ram = current_metrics["allocated_ram_mb"]
+            elif ram_delta > 0:
+                ram_ceiling_mb = int(current_metrics["allocated_ram_mb"] + available_for_scale)
+                if target_ram > ram_ceiling_mb:
+                    target_ram = ram_ceiling_mb
+
+
 
         # 3b. Active scale-down: when the host is critically RAM-stressed AND this
         #     container is genuinely idle relative to its allocation, reclaim headroom.
@@ -310,19 +419,29 @@ class Scaler:
         rolling_peaks: dict,
     ):
         """
-        Computes the optimal CPU / RAM sizing for a VM using a 14-day rolling peak
-        from the telemetry log plus a 30% safety headroom, then writes that as a
-        *pending* Proxmox config entry. The change takes effect on the next reboot—
-        no live hotplug is ever attempted.
+        Computes the optimal CPU / RAM sizing for a VM using a blended 14-day
+        statistic from the telemetry log plus safety headroom, then writes that
+        as a *pending* Proxmox config entry. The change takes effect on the next
+        reboot — no live hotplug is ever attempted.
 
-        Sizing formula
-        --------------
-        peak_ram_mb  = MAX(rolling 14-day observed RAM, prediction recent_peak)
-        peak_cpu_pct = MAX(rolling 14-day observed CPU%, prediction recent_peak_cpu)
+        CPU Sizing formula (spike-resistant)
+        -------------------------------------
+        Uses a weighted blend of three statistics from the 14-day window:
+          cpu_basis = 0.50 × p95_cpu_pct + 0.30 × avg_cpu_pct + 0.20 × peak_cpu_pct
 
-        target_ram   = clamp(int(peak_ram * 1.30), max(min_ram_mb, 1024), max_ram_mb)
-        needed_cores = int(peak_cpu_pct / 100 x current_cpus x 1.30) + 1
-        target_cpus  = clamp(needed_cores, min_cpus, max_cpus)
+        Why blend, not peak?
+          Using raw MAX meant a single spike from 13 days ago permanently over-sized
+          the VM, potentially causing launch failures if the host has fewer physical
+          CPUs available at boot time. The blend reflects sustained load while still
+          providing headroom for real bursts.
+
+        needed_cores = ceil(cpu_basis / 100 × base_cpus × cpu_buffer) + 1
+        target_cpus  = clamp(needed_cores, min_cpus, min(max_cpus, physical_cpus))
+
+        RAM Sizing formula
+        ------------------
+        peak_ram_mb  = MAX(14-day observed RAM peak, prediction recent_peak)
+        target_ram   = clamp(int(peak_ram * headroom), max(min_ram_mb, 1024), max_ram_mb)
 
         Config is only written when recommendation differs from current allocation
         by > 5% RAM or >= 1 CPU core.
@@ -335,45 +454,79 @@ class Scaler:
         alloc_cpus   = current_metrics["allocated_cpus"]
         alloc_ram_mb = current_metrics["allocated_ram_mb"]
 
+        # Hard ceiling: never schedule more vCPUs than the host physically has.
+        # This prevents a VM from failing to launch on the next boot because the
+        # config demands cores the hypervisor cannot provide.
+        host_metrics = self.px.get_host_usage()
+        physical_cpus = max(int(host_metrics.get("physical_cpus", alloc_cpus)), 1)
+
         # Fetch actual configuration from API to avoid logging changes that are already pending
         current_config = self.px.get_vm_config(vm_id)
         config_cpus = current_config.get("cpus", alloc_cpus)
         config_ram_mb = current_config.get("ram_mb", alloc_ram_mb)
 
         if sample_count > 0:
-            # Primary path: real observed peaks from the telemetry log
+            # Primary path: real observed statistics from the telemetry log.
+            # Blend P95 (50%), average (30%), and peak (20%) to get a representative
+            # CPU demand that is robust against single-cycle outliers.
+            p95_cpu   = rolling_peaks.get("p95_cpu_pct", rolling_peaks["peak_cpu_pct"])
+            avg_cpu   = rolling_peaks.get("avg_cpu_pct", rolling_peaks["peak_cpu_pct"])
+            peak_cpu  = rolling_peaks["peak_cpu_pct"]
+            cpu_basis = 0.50 * p95_cpu + 0.30 * avg_cpu + 0.20 * peak_cpu
+
             peak_ram_mb  = rolling_peaks["peak_ram_mb"]
-            peak_cpu_pct = rolling_peaks["peak_cpu_pct"]
-            source_label = f"{sample_count} telemetry samples"
+            source_label = (
+                f"{sample_count} telemetry samples "
+                f"(P95={p95_cpu:.1f}%, avg={avg_cpu:.1f}%, peak={peak_cpu:.1f}%)"
+            )
         else:
-            # Bootstrap: no log data yet (day one). Use the ML prediction peaks.
+            # Bootstrap: no log data yet (day one). Use the ML prediction smoothed
+            # values where available, falling back to raw predictions.
+            smoothed = predicted.get("smoothed_cpu_percent", None)
+            avg_pred  = predicted.get("recent_avg_cpu", None)
+            raw_peak  = max(predicted["cpu_percent"], predicted.get("recent_peak_cpu", 0.0))
+
+            if smoothed is not None and avg_pred is not None:
+                cpu_basis = 0.50 * smoothed + 0.30 * avg_pred + 0.20 * raw_peak
+            else:
+                cpu_basis = raw_peak
+
             peak_ram_mb  = max(
                 predicted["ram_usage_mb"],
                 predicted.get("recent_peak_ram", 0.0),
             )
-            peak_cpu_pct = max(
-                predicted["cpu_percent"],
-                predicted.get("recent_peak_cpu", 0.0),
-            )
-            source_label = "ML prediction peaks (no log data yet)"
+            source_label = "ML prediction (no log data yet)"
 
         logger.info(
-            f"[VM {vm_id}] Rolling peaks ({source_label}): "
-            f"{peak_ram_mb:.0f} MB RAM / {peak_cpu_pct:.1f}% CPU"
+            f"[VM {vm_id}] CPU basis for sizing: {cpu_basis:.1f}% "
+            f"({source_label}). "
+            f"Host physical CPUs: {physical_cpus}."
         )
 
-        # Apply 30% headroom above peak
+        # Apply RAM headroom above peak
         headroom   = 1 + self.ram_buffer_percent / 100.0
         target_ram = int(peak_ram_mb * headroom)
         target_ram = max(target_ram, 1024)              # Proxmox VM floor
         target_ram = max(target_ram, baseline["min_ram_mb"])
         target_ram = min(target_ram, baseline["max_ram_mb"])
 
+        # CPU: translate blended % demand into core count
         base_cpus = max(config_cpus, alloc_cpus)
         needed_cores = int(
-            (peak_cpu_pct / 100.0) * base_cpus * (1 + self.cpu_buffer_percent / 100.0)
+            (cpu_basis / 100.0) * base_cpus * (1 + self.cpu_buffer_percent / 100.0)
         ) + 1  # +1 ensures at least one core always recommended
-        target_cpus = max(baseline["min_cpus"], min(needed_cores, baseline["max_cpus"]))
+
+        # Clamp: baseline bounds AND physical host limit so VM can always launch.
+        target_cpus = max(
+            baseline["min_cpus"],
+            min(needed_cores, baseline["max_cpus"], physical_cpus),
+        )
+        if needed_cores > physical_cpus:
+            logger.warning(
+                f"[VM {vm_id}] CPU ceiling enforced: needed {needed_cores} cores "
+                f"but host only has {physical_cpus} physical CPUs. "
+                f"Clamping to {target_cpus}."
+            )
 
         # Only write when change is significant compared to existing CONFIG
         ram_delta_pct = abs(target_ram - config_ram_mb) / max(config_ram_mb, 1) * 100
@@ -390,8 +543,9 @@ class Scaler:
             f"[VM {vm_id}] PENDING CONFIG (applies on next reboot): "
             f"{target_cpus} CPUs (was {config_cpus}), "
             f"{target_ram} MB RAM (was {config_ram_mb:.0f} MB). "
-            f"Basis: {source_label} — 14-day peak {peak_ram_mb:.0f} MB / "
-            f"{peak_cpu_pct:.1f}% CPU + {self.ram_buffer_percent:.0f}% headroom."
+            f"Basis: {source_label} — "
+            f"blended cpu_basis {cpu_basis:.1f}% + {self.cpu_buffer_percent:.0f}% buffer, "
+            f"14-day peak RAM {peak_ram_mb:.0f} MB + {self.ram_buffer_percent:.0f}% headroom."
         )
         self.px.update_vm_resources(vm_id, target_cpus, target_ram)
         try:
@@ -406,3 +560,4 @@ class Scaler:
             )
         except Exception as log_err:
             logger.debug(f"[VM {vm_id}] Scale event log failed: {log_err}")
+
