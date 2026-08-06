@@ -7,6 +7,7 @@ from config import (
     LXC_TARGET_SWAP_MB,
     LXC_MIN_SWAP_MB,
     HOST_RAM_RESERVE_PERCENT,
+    SWAP_FLUSH_THRESHOLD_PERCENT,
 )
 from proxmox_api import ProxmoxClient
 
@@ -100,6 +101,7 @@ class Scaler:
         # At 0% host usage → full ram_buffer_percent. At the threshold → min 5%.
         host_ram_pressure_ratio = min(host_ram_pct / max(safe_ram_limit, 1.0), 1.0)
         effective_ram_buffer = max(5.0, self.ram_buffer_percent * (1.0 - host_ram_pressure_ratio))
+
         if effective_ram_buffer < self.ram_buffer_percent:
             logger.debug(
                 f"[{entity_type} {entity_id}] Host RAM at {host_ram_pct:.1f}% — tapering "
@@ -160,6 +162,7 @@ class Scaler:
             # Prevent scale-down unless host is in emergency state (>95%)
             if host_ram_pct < 95.0:
                 target_ram = max(target_ram, int(current_metrics["allocated_ram_mb"]))
+            target_ram = min(target_ram, baseline["max_ram_mb"])
 
         # Clamp target_cpus: respect baseline bounds AND never exceed physical host CPU count.
         target_cpus = max(baseline["min_cpus"], min(desired_cpus, baseline["max_cpus"], physical_cpus))
@@ -207,7 +210,7 @@ class Scaler:
                 f"threshold ({host_ram_pct:.1f}% > {safe_ram_limit}%)."
             )
             # But we can allow scaling down RAM, just not UP.
-            target_ram = current_metrics["allocated_ram_mb"]
+            target_ram = min(target_ram, current_metrics["allocated_ram_mb"])
 
         # Worst-case committed capacity check.
         # We treat every stopped VM/LXC as a latent demand that could materialise at
@@ -354,7 +357,8 @@ class Scaler:
         #    Triggers on: CPU change, RAM change (>=32 MB), swap cap change (>=32 MB),
         #    or swap saturation detected — whichever comes first.
         ram_diff = abs(target_ram - current_metrics["allocated_ram_mb"])
-        swap_diff = abs(target_swap - current_metrics.get("allocated_swap_mb", 0.0))
+        current_swap_alloc = current_metrics.get("allocated_swap_mb", 0.0)
+        swap_diff = abs(target_swap - current_swap_alloc) if entity_type == "LXC" else 0.0
 
         if (
             target_cpus != current_metrics["allocated_cpus"]
@@ -403,6 +407,14 @@ class Scaler:
                     )
                 except Exception as log_err:
                     logger.debug(f"[LXC {entity_id}] Scale event log failed: {log_err}")
+
+                # Check if LXC swap usage exceeds saturation threshold to trigger swap flush
+                swap_alloc_check = current_metrics.get("allocated_swap_mb", target_swap)
+                if swap_alloc_check > 0 and (swap_used / swap_alloc_check * 100.0) >= SWAP_FLUSH_THRESHOLD_PERCENT:
+                    ram_headroom = target_ram - current_usage_mb
+                    if ram_headroom >= swap_used * 1.1:
+                        if hasattr(self.px, "flush_lxc_swap"):
+                            self.px.flush_lxc_swap(entity_id)
             elif entity_type == "VM":
                 self.px.update_vm_resources(entity_id, target_cpus, target_ram)
         else:
@@ -461,7 +473,10 @@ class Scaler:
         physical_cpus = max(int(host_metrics.get("physical_cpus", alloc_cpus)), 1)
 
         # Fetch actual configuration from API to avoid logging changes that are already pending
-        current_config = self.px.get_vm_config(vm_id)
+        if hasattr(self.px, "get_vm_config"):
+            current_config = self.px.get_vm_config(vm_id) or {}
+        else:
+            current_config = {}
         config_cpus = current_config.get("cpus", alloc_cpus)
         config_ram_mb = current_config.get("ram_mb", alloc_ram_mb)
 
@@ -528,9 +543,20 @@ class Scaler:
                 f"Clamping to {target_cpus}."
             )
 
+        config_sockets = current_config.get("sockets", 1)
+        # Ensure target_cpus does not exceed maximum sockets range configured for VM.
+        # If target_cpus requires more sockets (e.g. current_sockets * cores_per_socket),
+        # calculate target_sockets needed so target_cpus can be allocated cleanly.
+        target_sockets = config_sockets
+        if target_cpus > config_sockets * (config_cpus // max(config_sockets, 1)):
+            # If current VM setup has 1 socket and config_cpus were assigned per core,
+            # ensure target_sockets is adjusted if target_cpus exceeds current sockets capacity.
+            cores_per_socket = max(1, config_cpus // max(config_sockets, 1))
+            target_sockets = max(1, (target_cpus + cores_per_socket - 1) // cores_per_socket)
+
         # Only write when change is significant compared to existing CONFIG
         ram_delta_pct = abs(target_ram - config_ram_mb) / max(config_ram_mb, 1) * 100
-        cpu_changed   = target_cpus != config_cpus
+        cpu_changed   = (target_cpus != config_cpus) or (target_sockets != config_sockets)
 
         if ram_delta_pct < 5.0 and not cpu_changed:
             logger.debug(
@@ -542,12 +568,13 @@ class Scaler:
         logger.info(
             f"[VM {vm_id}] PENDING CONFIG (applies on next reboot): "
             f"{target_cpus} CPUs (was {config_cpus}), "
+            f"{target_sockets} sockets (was {config_sockets}), "
             f"{target_ram} MB RAM (was {config_ram_mb:.0f} MB). "
             f"Basis: {source_label} — "
             f"blended cpu_basis {cpu_basis:.1f}% + {self.cpu_buffer_percent:.0f}% buffer, "
             f"14-day peak RAM {peak_ram_mb:.0f} MB + {self.ram_buffer_percent:.0f}% headroom."
         )
-        self.px.update_vm_resources(vm_id, target_cpus, target_ram)
+        self.px.update_vm_resources(vm_id, target_cpus, target_ram, sockets=target_sockets if target_sockets != config_sockets else None)
         try:
             storage.log_scale_event(
                 entity_id=vm_id,

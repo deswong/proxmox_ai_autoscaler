@@ -220,8 +220,10 @@ class ProxmoxClient:
             )
             return {}
 
-    def update_vm_resources(self, vm_id: str, cpus: int, ram_mb: int):
-        """Updates the CPU cores and RAM allocation of a running VM."""
+    def update_vm_resources(
+        self, vm_id: str, cpus: int, ram_mb: int, sockets: int = None
+    ):
+        """Updates the CPU cores, RAM allocation, and optionally sockets of a VM."""
         if not self.proxmox:
             return False
 
@@ -230,10 +232,14 @@ class ProxmoxClient:
         for attempt in range(max_retries):
             try:
                 # Requires Hotplug to be enabled in Proxmox VM Hardware configs
-                self.node.qemu(vm_id).config.put(cores=int(cpus), memory=int(ram_mb))
-                logger.info(
-                    f"[VM {vm_id}] Successfully hotplugged resources: {cpus} cores, {ram_mb} MB RAM"
-                )
+                kwargs = {"cores": int(cpus), "memory": int(ram_mb)}
+                if sockets is not None:
+                    kwargs["sockets"] = int(sockets)
+                self.node.qemu(vm_id).config.put(**kwargs)
+                log_msg = f"[VM {vm_id}] Successfully updated resources: {cpus} cores, {ram_mb} MB RAM"
+                if sockets is not None:
+                    log_msg += f", {sockets} sockets"
+                logger.info(log_msg)
                 return True
             except Exception as e:
                 logger.error(
@@ -246,7 +252,7 @@ class ProxmoxClient:
 
     def get_vm_config(self, vm_id: str) -> dict:
         """
-        Retrieves the exact configuration (CPU cores, RAM) of a VM, checking both active
+        Retrieves the exact configuration (CPU cores, RAM, sockets) of a VM, checking both active
         and pending settings to avoid redundant API write loops.
         """
         if not self.proxmox:
@@ -255,6 +261,7 @@ class ProxmoxClient:
             config = self.node.qemu(vm_id).config.get()
             cpus = int(config.get("cores", 1))
             ram_mb = int(config.get("memory", 512))
+            sockets = int(config.get("sockets", 1))
 
             # Query pending configuration changes if available
             try:
@@ -266,12 +273,15 @@ class ProxmoxClient:
                             cpus = int(item["pending"])
                         elif key == "memory":
                             ram_mb = int(item["pending"])
+                        elif key == "sockets":
+                            sockets = int(item["pending"])
             except Exception as pending_err:
                 logger.debug(f"[VM {vm_id}] Could not query pending config: {pending_err}")
 
             return {
                 "cpus": cpus,
                 "ram_mb": ram_mb,
+                "sockets": sockets,
             }
         except Exception as e:
             logger.error(f"Failed to fetch config for VM {vm_id}: {e}")

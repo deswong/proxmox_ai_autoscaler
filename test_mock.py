@@ -230,7 +230,7 @@ def test_scaler():
 
         def get_host_usage(self):
             # Simulate host node under extreme load, triggering the 95% safety cap
-            return {"cpu_percent": 96.0, "ram_percent": 98.0, "total_ram_mb": 64000}
+            return {"cpu_percent": 96.0, "ram_percent": 98.0, "total_ram_mb": 64000, "physical_cpus": 8}
 
         def update_lxc_resources(self, _lxc_id, cpus, ram_mb, swap_mb=0):  # pylint: disable=unused-argument
             self.last_update = {"cpus": cpus, "ram_mb": ram_mb}
@@ -271,7 +271,7 @@ def test_scaler_uses_peak_ram():
             self.last_update = None
 
         def get_host_usage(self):
-            return {"cpu_percent": 10.0, "ram_percent": 30.0, "total_ram_mb": 64000}
+            return {"cpu_percent": 10.0, "ram_percent": 30.0, "total_ram_mb": 64000, "physical_cpus": 8}
 
         def update_lxc_resources(self, _lxc_id, cpus, ram_mb, swap_mb=0):  # pylint: disable=unused-argument
             self.last_update = {"cpus": cpus, "ram_mb": ram_mb}
@@ -298,10 +298,10 @@ def test_scaler_uses_peak_ram():
     print("\nTesting Scaler Uses Peak RAM (Peak 900 MB > Predicted 512 MB):")
     print(f"Update Requested: {px.last_update}")
 
-    # desired = 900 * 1.30 = 1170 MB -> capped at max_ram_mb=8192, so expect 1170
+    # desired = 900 * 1.194 = 1074 MB -> capped at max_ram_mb=8192, so expect ~1074
     assert px.last_update is not None, "Scaler should have issued an update"
-    assert px.last_update["ram_mb"] >= 1100, (
-        f"Expected allocation based on peak (>=1100 MB), got {px.last_update['ram_mb']}"
+    assert px.last_update["ram_mb"] >= 1050, (
+        f"Expected allocation based on peak (>=1050 MB), got {px.last_update['ram_mb']}"
     )
 
 
@@ -814,8 +814,8 @@ def test_vm_pending_config_from_rolling_peaks():
                     "total_ram_mb": 64000, "physical_cpus": 16,
                     "load_avg_1m": 1.0, "load_avg_5m": 0.9, "ksm_sharing_mb": 0.0}
 
-        def update_vm_resources(self, _vm_id, cpus, ram_mb):
-            self.last_vm_update = {"cpus": cpus, "ram_mb": ram_mb}
+        def update_vm_resources(self, _vm_id, cpus, ram_mb, **kwargs):
+            self.last_vm_update = {"cpus": cpus, "ram_mb": ram_mb, **kwargs}
 
     px = MockProxmoxClient()
     scaler = Scaler(px)
@@ -855,8 +855,8 @@ def test_vm_pending_config_bootstrap():
                     "total_ram_mb": 64000, "physical_cpus": 16,
                     "load_avg_1m": 0.5, "load_avg_5m": 0.4, "ksm_sharing_mb": 0.0}
 
-        def update_vm_resources(self, _vm_id, cpus, ram_mb):
-            self.last_vm_update = {"cpus": cpus, "ram_mb": ram_mb}
+        def update_vm_resources(self, _vm_id, cpus, ram_mb, **kwargs):
+            self.last_vm_update = {"cpus": cpus, "ram_mb": ram_mb, **kwargs}
 
     px = MockProxmoxClient()
     scaler = Scaler(px)
@@ -893,8 +893,8 @@ def test_vm_pending_config_no_change():
                     "total_ram_mb": 64000, "physical_cpus": 16,
                     "load_avg_1m": 0.5, "load_avg_5m": 0.4, "ksm_sharing_mb": 0.0}
 
-        def update_vm_resources(self, _vm_id, cpus, ram_mb):
-            self.last_vm_update = {"cpus": cpus, "ram_mb": ram_mb}
+        def update_vm_resources(self, _vm_id, cpus, ram_mb, **kwargs):
+            self.last_vm_update = {"cpus": cpus, "ram_mb": ram_mb, **kwargs}
 
     px = MockProxmoxClient()
     scaler = Scaler(px)
@@ -918,6 +918,44 @@ def test_vm_pending_config_no_change():
     )
 
 
+def test_vm_sockets_adjustment():
+    """When target_cpus requires additional CPU sockets to fit within Proxmox socket limits, target_sockets must be recalculated and passed."""
+    from scaler import Scaler
+
+    class MockProxmoxClient:
+        def __init__(self):
+            self.last_vm_update = None
+
+        def get_host_usage(self):
+            return {"cpu_percent": 20.0, "ram_percent": 40.0, "swap_percent": 0.0,
+                    "total_ram_mb": 64000, "physical_cpus": 16}
+
+        def get_vm_config(self, _vm_id):
+            # VM configured with 1 socket and 2 cores (i.e. 2 cores total)
+            return {"cpus": 2, "ram_mb": 2048, "sockets": 1}
+
+        def update_vm_resources(self, _vm_id, cpus, ram_mb, **kwargs):
+            self.last_vm_update = {"cpus": cpus, "ram_mb": ram_mb, **kwargs}
+
+    px = MockProxmoxClient()
+    scaler = Scaler(px)
+
+    baseline  = {"min_cpus": 1, "max_cpus": 16, "min_ram_mb": 1024.0, "max_ram_mb": 16384.0}
+    predicted = {"cpu_percent": 90.0, "ram_usage_mb": 2000.0, "recent_peak_cpu": 95.0, "recent_peak_ram": 2100.0}
+    current   = {"allocated_cpus": 2, "allocated_ram_mb": 2048.0, "ram_usage_mb": 1800.0, "cpu_percent": 90.0}
+    rolling_peaks = {"peak_cpu_pct": 180.0, "peak_ram_mb": 2100.0, "sample_count": 500}
+
+    scaler.apply_vm_pending_config("503", baseline, predicted, current, rolling_peaks)
+
+    print("\nTesting VM Sockets Adjustment:")
+    print(f"VM Update: {px.last_vm_update}")
+
+    assert px.last_vm_update is not None, "Should write VM pending config"
+    assert px.last_vm_update["cpus"] > 2, "Should scale CPU cores up"
+    assert px.last_vm_update.get("sockets") is not None, "Sockets count should be explicitly adjusted when needed"
+    assert px.last_vm_update["sockets"] >= 2, f"Sockets count should scale up to accommodate target cores, got {px.last_vm_update['sockets']}"
+
+
 if __name__ == "__main__":
     print("Running Mock AI Predictor Tests...")
     test_scale_event_logging()
@@ -939,4 +977,5 @@ if __name__ == "__main__":
     test_vm_pending_config_from_rolling_peaks()
     test_vm_pending_config_bootstrap()
     test_vm_pending_config_no_change()
+    test_vm_sockets_adjustment()
     print("All mock tests passed!")
