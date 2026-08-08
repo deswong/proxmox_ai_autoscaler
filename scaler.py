@@ -543,16 +543,14 @@ class Scaler:
                 f"Clamping to {target_cpus}."
             )
 
+        # In Proxmox QEMU topology, total vCPUs = sockets * cores.
+        # When scaling vCPUs, setting `sockets = 1` and `cores = target_cpus` (or ensuring total vCPUs
+        # match sockets * cores) prevents QEMU invalid CPU socket-id launch failures.
         config_sockets = current_config.get("sockets", 1)
-        # Ensure target_cpus does not exceed maximum sockets range configured for VM.
-        # If target_cpus requires more sockets (e.g. current_sockets * cores_per_socket),
-        # calculate target_sockets needed so target_cpus can be allocated cleanly.
-        target_sockets = config_sockets
-        if target_cpus > config_sockets * (config_cpus // max(config_sockets, 1)):
-            # If current VM setup has 1 socket and config_cpus were assigned per core,
-            # ensure target_sockets is adjusted if target_cpus exceeds current sockets capacity.
-            cores_per_socket = max(1, config_cpus // max(config_sockets, 1))
-            target_sockets = max(1, (target_cpus + cores_per_socket - 1) // cores_per_socket)
+        
+        # We ensure sockets is set to 1 (or kept at 1) so that all target_cpus are assigned as cores per socket 1.
+        # This guarantees QEMU socket-id is 0 and valid (range 0:0).
+        target_sockets = 1 if config_sockets > 1 or target_cpus > 1 else config_sockets
 
         # Only write when change is significant compared to existing CONFIG
         ram_delta_pct = abs(target_ram - config_ram_mb) / max(config_ram_mb, 1) * 100
@@ -567,14 +565,17 @@ class Scaler:
 
         logger.info(
             f"[VM {vm_id}] PENDING CONFIG (applies on next reboot): "
-            f"{target_cpus} CPUs (was {config_cpus}), "
+            f"{target_cpus} CPUs/cores (was {config_cpus}), "
             f"{target_sockets} sockets (was {config_sockets}), "
             f"{target_ram} MB RAM (was {config_ram_mb:.0f} MB). "
             f"Basis: {source_label} — "
             f"blended cpu_basis {cpu_basis:.1f}% + {self.cpu_buffer_percent:.0f}% buffer, "
             f"14-day peak RAM {peak_ram_mb:.0f} MB + {self.ram_buffer_percent:.0f}% headroom."
         )
-        self.px.update_vm_resources(vm_id, target_cpus, target_ram, sockets=target_sockets if target_sockets != config_sockets else None)
+        self.px.update_vm_resources(
+            vm_id, target_cpus, target_ram,
+            sockets=target_sockets if (target_sockets != config_sockets or config_sockets > 1) else None
+        )
         try:
             storage.log_scale_event(
                 entity_id=vm_id,

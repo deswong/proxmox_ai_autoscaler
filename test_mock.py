@@ -919,7 +919,7 @@ def test_vm_pending_config_no_change():
 
 
 def test_vm_sockets_adjustment():
-    """When target_cpus requires additional CPU sockets to fit within Proxmox socket limits, target_sockets must be recalculated and passed."""
+    """When scaling target_cpus, sockets should be maintained as 1 (with all vCPUs assigned as cores) to prevent QEMU socket-id errors."""
     from scaler import Scaler
 
     class MockProxmoxClient:
@@ -931,8 +931,8 @@ def test_vm_sockets_adjustment():
                     "total_ram_mb": 64000, "physical_cpus": 16}
 
         def get_vm_config(self, _vm_id):
-            # VM configured with 1 socket and 2 cores (i.e. 2 cores total)
-            return {"cpus": 2, "ram_mb": 2048, "sockets": 1}
+            # VM configured with 2 sockets previously
+            return {"cpus": 2, "ram_mb": 2048, "sockets": 2}
 
         def update_vm_resources(self, _vm_id, cpus, ram_mb, **kwargs):
             self.last_vm_update = {"cpus": cpus, "ram_mb": ram_mb, **kwargs}
@@ -952,8 +952,7 @@ def test_vm_sockets_adjustment():
 
     assert px.last_vm_update is not None, "Should write VM pending config"
     assert px.last_vm_update["cpus"] > 2, "Should scale CPU cores up"
-    assert px.last_vm_update.get("sockets") is not None, "Sockets count should be explicitly adjusted when needed"
-    assert px.last_vm_update["sockets"] >= 2, f"Sockets count should scale up to accommodate target cores, got {px.last_vm_update['sockets']}"
+    assert px.last_vm_update.get("sockets") == 1, f"Sockets count should normalize to 1, got {px.last_vm_update.get('sockets')}"
 
 
 if __name__ == "__main__":
