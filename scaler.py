@@ -273,7 +273,7 @@ class Scaler:
             host_free_mb = total_ram_mb * (1.0 - host_ram_pct / 100.0)
             available_for_scale = host_free_mb - reserved_mb
             ram_delta = target_ram - current_metrics["allocated_ram_mb"]
-            if ram_delta > 0 and available_for_scale <= 0:
+            if available_for_scale <= 0 < ram_delta:
                 logger.warning(
                     f"[{entity_type} {entity_id}] AVAILABLE-RAM CAP: No headroom left after "
                     f"{HOST_RAM_RESERVE_PERCENT:.0f}% reserve ({reserved_mb:.0f} MB). "
@@ -282,8 +282,7 @@ class Scaler:
                 target_ram = current_metrics["allocated_ram_mb"]
             elif ram_delta > 0:
                 ram_ceiling_mb = int(current_metrics["allocated_ram_mb"] + available_for_scale)
-                if target_ram > ram_ceiling_mb:
-                    target_ram = ram_ceiling_mb
+                target_ram = min(target_ram, ram_ceiling_mb)
 
 
 
@@ -339,12 +338,12 @@ class Scaler:
                 )
             else:
                 target_swap = max(LXC_TARGET_SWAP_MB, LXC_MIN_SWAP_MB)
-            
+
             # NATURAL RECLAIM "DO NO HARM" FLOOR:
             # Never set the swap limit lower than the active swap usage plus a 32MB buffer.
-            # Why? Because lowering the cgroup limit below usage forces the Linux kernel into 
-            # a synchronous reclaim (pausing the container, reading disk sequentially to RAM). 
-            # This causes catastrophic I/O stalls in Proxmox. We MUST let the OS page it back 
+            # Why? Because lowering the cgroup limit below usage forces the Linux kernel into
+            # a synchronous reclaim (pausing the container, reading disk sequentially to RAM).
+            # This causes catastrophic I/O stalls in Proxmox. We MUST let the OS page it back
             # gently on its own schedule.
             safe_floor = int(swap_used + 32)
             if target_swap < safe_floor and swap_used > 5:
@@ -547,7 +546,7 @@ class Scaler:
         # When scaling vCPUs, setting `sockets = 1` and `cores = target_cpus` (or ensuring total vCPUs
         # match sockets * cores) prevents QEMU invalid CPU socket-id launch failures.
         config_sockets = current_config.get("sockets", 1)
-        
+
         # We ensure sockets is set to 1 (or kept at 1) so that all target_cpus are assigned as cores per socket 1.
         # This guarantees QEMU socket-id is 0 and valid (range 0:0).
         target_sockets = 1 if config_sockets > 1 or target_cpus > 1 else config_sockets
@@ -588,4 +587,3 @@ class Scaler:
             )
         except Exception as log_err:
             logger.debug(f"[VM {vm_id}] Scale event log failed: {log_err}")
-
