@@ -282,6 +282,7 @@ class ProxmoxClient:
                 "cpus": cpus,
                 "ram_mb": ram_mb,
                 "sockets": sockets,
+                "total_vcpus": cpus * sockets,
             }
         except Exception as e:
             logger.error(f"Failed to fetch config for VM {vm_id}: {e}")

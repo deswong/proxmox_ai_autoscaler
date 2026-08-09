@@ -1,3 +1,4 @@
+import math
 import logging
 import storage
 from config import (
@@ -524,11 +525,26 @@ class Scaler:
         target_ram = max(target_ram, baseline["min_ram_mb"])
         target_ram = min(target_ram, baseline["max_ram_mb"])
 
-        # CPU: translate blended % demand into core count
-        base_cpus = max(config_cpus, alloc_cpus)
-        needed_cores = int(
-            (cpu_basis / 100.0) * base_cpus * (1 + self.cpu_buffer_percent / 100.0)
-        ) + 1  # +1 ensures at least one core always recommended
+        # CPU: translate blended % demand into vCPU core count.
+        # In Proxmox QEMU topology, current total vCPUs = sockets * cores.
+        config_sockets = current_config.get("sockets", 1)
+        config_cores   = current_config.get("cpus", alloc_cpus)
+        base_vcpus     = max(config_cores * config_sockets, alloc_cpus)
+
+        # cpu_basis is percentage demand for the VM (0-100% per VM allocation).
+        # Clamp cpu_basis to 100.0% max so historical multi-core RRD metric artifacts
+        # or spikes do not artificially multiply core requirements.
+        effective_cpu_pct = min(cpu_basis, 100.0)
+
+        # Calculate actual vCPUs needed with headroom buffer:
+        # e.g., at 50% load on 1 vCPU, needed_cores = ceil(0.50 * 1 * 1.20) = 1 vCPU.
+        needed_cores = max(
+            1,
+            math.ceil((effective_cpu_pct / 100.0) * base_vcpus * (1 + self.cpu_buffer_percent / 100.0))
+        )
+
+        # Step cap: prevent single-cycle overprovisioning jumps greater than +2 vCPUs above base_vcpus
+        needed_cores = min(needed_cores, base_vcpus + 2)
 
         # Clamp: baseline bounds AND physical host limit so VM can always launch.
         target_cpus = max(
@@ -541,11 +557,6 @@ class Scaler:
                 f"but host only has {physical_cpus} physical CPUs. "
                 f"Clamping to {target_cpus}."
             )
-
-        # In Proxmox QEMU topology, total vCPUs = sockets * cores.
-        # When scaling vCPUs, setting `sockets = 1` and `cores = target_cpus` (or ensuring total vCPUs
-        # match sockets * cores) prevents QEMU invalid CPU socket-id launch failures.
-        config_sockets = current_config.get("sockets", 1)
 
         # We ensure sockets is set to 1 (or kept at 1) so that all target_cpus are assigned as cores per socket 1.
         # This guarantees QEMU socket-id is 0 and valid (range 0:0).

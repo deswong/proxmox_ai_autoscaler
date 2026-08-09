@@ -955,6 +955,42 @@ def test_vm_sockets_adjustment():
     assert px.last_vm_update.get("sockets") == 1, f"Sockets count should normalize to 1, got {px.last_vm_update.get('sockets')}"
 
 
+def test_vm_single_core_single_socket_no_overprovision():
+    """Ensure a VM configured with 1 core and 1 socket is not overprovisioned to 7 vCPUs under moderate/high load or metric spikes."""
+    from scaler import Scaler
+
+    class MockProxmoxClient:
+        def __init__(self):
+            self.last_vm_update = None
+
+        def get_host_usage(self):
+            return {"cpu_percent": 20.0, "ram_percent": 40.0, "swap_percent": 0.0,
+                    "total_ram_mb": 64000, "physical_cpus": 16}
+
+        def get_vm_config(self, _vm_id):
+            return {"cpus": 1, "ram_mb": 1024, "sockets": 1}
+
+        def update_vm_resources(self, _vm_id, cpus, ram_mb, **kwargs):
+            self.last_vm_update = {"cpus": cpus, "ram_mb": ram_mb, **kwargs}
+
+    px = MockProxmoxClient()
+    scaler = Scaler(px)
+
+    baseline  = {"min_cpus": 1, "max_cpus": 16, "min_ram_mb": 1024.0, "max_ram_mb": 16384.0}
+    predicted = {"cpu_percent": 50.0, "ram_usage_mb": 1024.0, "recent_peak_cpu": 60.0, "recent_peak_ram": 1024.0}
+    current   = {"allocated_cpus": 1, "allocated_ram_mb": 1024.0, "ram_usage_mb": 512.0, "cpu_percent": 50.0}
+    # Even if rolling peaks recorded a high percentage spike (e.g. 250%), it should not jump to 7 vCPUs
+    rolling_peaks = {"peak_cpu_pct": 250.0, "peak_ram_mb": 1024.0, "sample_count": 500}
+
+    scaler.apply_vm_pending_config("504", baseline, predicted, current, rolling_peaks)
+
+    print("\nTesting VM Single Core/Socket Overprovision Guard:")
+    print(f"VM Update: {px.last_vm_update}")
+
+    if px.last_vm_update is not None:
+        assert px.last_vm_update["cpus"] <= 3, f"1 core 1 socket VM scaled to {px.last_vm_update['cpus']} vCPUs (expected <= 3)"
+
+
 if __name__ == "__main__":
     print("Running Mock AI Predictor Tests...")
     test_scale_event_logging()
@@ -977,4 +1013,6 @@ if __name__ == "__main__":
     test_vm_pending_config_bootstrap()
     test_vm_pending_config_no_change()
     test_vm_sockets_adjustment()
+    test_vm_single_core_single_socket_no_overprovision()
     print("All mock tests passed!")
+
