@@ -550,6 +550,9 @@ def test_scaler_safe_flush_guard():
 
     # target_ram is clamped at max_ram_mb=2048; ram_usage_mb=1910 -> headroom=138 MB
     # swap_used=400 MB -> needs 400*1.1=440 MB headroom -> 138 < 440 -> flush blocked
+    # allocated_swap_mb=1024 (old Proxmox default cap); target_swap = max(int(400*1.30), 256)
+    # = 520; swap_diff = |520 - 1024| = 504 MB >= 32 -> update still fires so we can
+    # verify the flush guard blocks the actual flush call.
     baseline = {"min_cpus": 2, "max_cpus": 2, "min_ram_mb": 2048.0, "max_ram_mb": 2048.0}
     predicted = {
         "cpu_percent": 10.0,
@@ -565,16 +568,16 @@ def test_scaler_safe_flush_guard():
         "ram_usage_mb": 1910.0,
         "cpu_percent": 10.0,
         "swap_mb": 400.0,
-        "allocated_swap_mb": 512.0,  # 400/512 = 78% > 50% threshold -> flush desired
+        "allocated_swap_mb": 1024.0,  # Large old cap -> target ~520 -> diff=504 MB >= 32 -> update fires
     }
 
     scaler.evaluate_and_scale("205", "LXC", baseline, predicted, current_metrics)
 
-    print("\nTesting Safe Flush Guard (headroom 148 MB < swap 400*1.1=440 MB):")
+    print("\nTesting Safe Flush Guard (headroom 138 MB < swap 400*1.1=440 MB):")
     print(f"Update Requested: {px.last_update}")
     print(f"Flush Called: {px.flush_called}")
 
-    assert px.last_update is not None, "Scaler should still issue a resource update"
+    assert px.last_update is not None, "Scaler should still issue a resource update (swap cap correction)"
     assert not px.flush_called, (
         "Scaler must NOT flush swap when RAM headroom is insufficient"
     )
@@ -931,8 +934,8 @@ def test_vm_sockets_adjustment():
                     "total_ram_mb": 64000, "physical_cpus": 16}
 
         def get_vm_config(self, _vm_id):
-            # VM configured with 2 sockets previously
-            return {"cpus": 2, "ram_mb": 2048, "sockets": 2}
+            # VM configured with 2 sockets previously — keys use 'cores' as returned by get_vm_config()
+            return {"cores": 2, "ram_mb": 2048, "sockets": 2, "total_vcpus": 4}
 
         def update_vm_resources(self, _vm_id, cpus, ram_mb, **kwargs):
             self.last_vm_update = {"cpus": cpus, "ram_mb": ram_mb, **kwargs}
@@ -968,7 +971,7 @@ def test_vm_single_core_single_socket_no_overprovision():
                     "total_ram_mb": 64000, "physical_cpus": 16}
 
         def get_vm_config(self, _vm_id):
-            return {"cpus": 1, "ram_mb": 1024, "sockets": 1}
+            return {"cores": 1, "ram_mb": 1024, "sockets": 1, "total_vcpus": 1}
 
         def update_vm_resources(self, _vm_id, cpus, ram_mb, **kwargs):
             self.last_vm_update = {"cpus": cpus, "ram_mb": ram_mb, **kwargs}
@@ -989,6 +992,64 @@ def test_vm_single_core_single_socket_no_overprovision():
 
     if px.last_vm_update is not None:
         assert px.last_vm_update["cpus"] <= 3, f"1 core 1 socket VM scaled to {px.last_vm_update['cpus']} vCPUs (expected <= 3)"
+
+
+def test_evaluate_and_scale_vm_live_hotplug():
+    """evaluate_and_scale() for a VM must call update_vm_resources with the correct
+    cores and vcpus when live hotplug is triggered (e.g. blended CPU > 85%).
+    This exercises the VM branch of evaluate_and_scale (line 418 in scaler.py)
+    which was previously untested."""
+    from scaler import Scaler
+
+    class MockProxmoxClient:
+        def __init__(self):
+            self.last_vm_update = None
+            self._call_args = None
+
+        def get_host_usage(self):
+            return {
+                "cpu_percent": 20.0, "ram_percent": 30.0, "swap_percent": 2.0,
+                "total_ram_mb": 64000, "physical_cpus": 8,
+                "load_avg_1m": 1.0, "load_avg_5m": 0.9, "ksm_sharing_mb": 0.0,
+                "committed_cpus": 4, "committed_ram_mb": 8192.0,
+            }
+
+        def update_vm_resources(self, _vm_id, cpus, ram_mb, sockets=None):
+            self.last_vm_update = {"cpus": cpus, "ram_mb": ram_mb, "sockets": sockets}
+
+    px = MockProxmoxClient()
+    scaler = Scaler(px)
+
+    # VM running at 90% CPU on 1 core — blended CPU will exceed 85% threshold, triggering scale-up.
+    baseline = {"min_cpus": 1, "max_cpus": 4, "min_ram_mb": 1024, "max_ram_mb": 8192}
+    predicted = {
+        "cpu_percent": 90.0,
+        "ram_usage_mb": 1500.0,
+        "recent_peak_ram": 1600.0,
+        "smoothed_cpu_percent": 88.0,
+    }
+    current_metrics = {
+        "allocated_cpus": 1,
+        "allocated_ram_mb": 2048.0,
+        "ram_usage_mb": 1400.0,
+        "cpu_percent": 90.0,
+    }
+
+    scaler.evaluate_and_scale("600", "VM", baseline, predicted, current_metrics)
+
+    print("\nTesting VM Live Hotplug (evaluate_and_scale VM branch, 90% CPU):")
+    print(f"VM Update: {px.last_vm_update}")
+
+    assert px.last_vm_update is not None, (
+        "Scaler should issue a live hotplug update for a VM at 90% CPU"
+    )
+    # blended_cpu = 0.6*88 + 0.4*90 = 52.8+36 = 88.8 > 85 -> +1 core -> desired = 2
+    assert px.last_vm_update["cpus"] >= 2, (
+        f"Expected at least 2 cores after scale-up from 90% CPU, got {px.last_vm_update['cpus']}"
+    )
+    assert px.last_vm_update["cpus"] <= 4, (
+        f"CPU must not exceed max_cpus=4, got {px.last_vm_update['cpus']}"
+    )
 
 
 if __name__ == "__main__":
@@ -1014,5 +1075,6 @@ if __name__ == "__main__":
     test_vm_pending_config_no_change()
     test_vm_sockets_adjustment()
     test_vm_single_core_single_socket_no_overprovision()
+    test_evaluate_and_scale_vm_live_hotplug()
     print("All mock tests passed!")
 

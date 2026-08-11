@@ -323,15 +323,19 @@ def _seed_initial_baselines():
             ),
         )
 
-    # 2. Prune any forgotten instances out of the local cache
+    # 2. Prune baselines that are no longer in the .env config.
+    # IMPORTANT: If INITIAL_CONFIGS is empty (e.g. .env failed to load or has no
+    # LXC_*/VM_* entries), we skip pruning entirely. Deleting all baselines on an
+    # empty config would remove every safety bound on the next service restart,
+    # potentially allowing unbounded scale-ups on all containers.
     if INITIAL_CONFIGS:
         placeholders = ",".join(["?"] * len(INITIAL_CONFIGS))
         cursor.execute(
             f"DELETE FROM lxc_baselines WHERE lxc_id NOT IN ({placeholders})",
             list(INITIAL_CONFIGS.keys()),
         )
-    else:
-        cursor.execute("DELETE FROM lxc_baselines")
+    # else: empty INITIAL_CONFIGS means .env has no entities configured or failed
+    # to load — retain existing DB baselines rather than wiping them.
 
     conn.commit()
     conn.close()
