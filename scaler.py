@@ -363,7 +363,7 @@ class Scaler:
         if (
             target_cpus != current_metrics["allocated_cpus"]
             or ram_diff >= 32
-            or swap_diff > 0
+            or swap_diff >= 32  # match RAM threshold — avoids micro-updates on 1-MB rounding changes
         ):
             cpu_action = "UNCHANGED"
             if target_cpus > current_metrics["allocated_cpus"]:
@@ -528,7 +528,11 @@ class Scaler:
         # CPU: translate blended % demand into vCPU core count.
         # In Proxmox QEMU topology, current total vCPUs = sockets * cores.
         config_sockets = current_config.get("sockets", 1)
-        config_cores   = current_config.get("cpus", alloc_cpus)
+        config_cores   = current_config.get("cores", alloc_cpus)   # cores per socket
+        # base_vcpus: use the larger of config-defined vCPUs or the live running count.
+        # The live alloc_cpus (cores×sockets at last boot) guards against an abrupt
+        # scale-down immediately after a sockets topology change is applied but before
+        # the VM has been rebooted to pick up the new pending config.
         base_vcpus     = max(config_cores * config_sockets, alloc_cpus)
 
         # cpu_basis is percentage demand for the VM (0-100% per VM allocation).
@@ -558,13 +562,14 @@ class Scaler:
                 f"Clamping to {target_cpus}."
             )
 
-        # We ensure sockets is set to 1 (or kept at 1) so that all target_cpus are assigned as cores per socket 1.
-        # This guarantees QEMU socket-id is 0 and valid (range 0:0).
-        target_sockets = 1 if config_sockets > 1 or target_cpus > 1 else config_sockets
+        # Always normalise to 1 socket; all vCPUs are assigned as cores on socket 0.
+        # This keeps the QEMU socket-id valid (range 0:0) and avoids NUMA topology
+        # mismatches that occur when sockets > 1 is left in a pending config.
+        target_sockets = 1
 
         # Only write when change is significant compared to existing CONFIG
         ram_delta_pct = abs(target_ram - config_ram_mb) / max(config_ram_mb, 1) * 100
-        cpu_changed   = (target_cpus != config_cpus) or (target_sockets != config_sockets)
+        cpu_changed   = (target_cpus != config_cores) or (target_sockets != config_sockets)
 
         if ram_delta_pct < 5.0 and not cpu_changed:
             logger.debug(
@@ -575,7 +580,7 @@ class Scaler:
 
         logger.info(
             f"[VM {vm_id}] PENDING CONFIG (applies on next reboot): "
-            f"{target_cpus} CPUs/cores (was {config_cpus}), "
+            f"{target_cpus} CPUs/cores (was {config_cores}), "
             f"{target_sockets} sockets (was {config_sockets}), "
             f"{target_ram} MB RAM (was {config_ram_mb:.0f} MB). "
             f"Basis: {source_label} — "
@@ -584,7 +589,7 @@ class Scaler:
         )
         self.px.update_vm_resources(
             vm_id, target_cpus, target_ram,
-            sockets=target_sockets if (target_sockets != config_sockets or config_sockets > 1) else None
+            sockets=target_sockets,  # always pass sockets so vcpus is reset correctly
         )
         try:
             storage.log_scale_event(

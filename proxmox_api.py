@@ -232,11 +232,19 @@ class ProxmoxClient:
         for attempt in range(max_retries):
             try:
                 # Requires Hotplug to be enabled in Proxmox VM Hardware configs
-                kwargs = {"cores": int(cpus), "memory": int(ram_mb)}
+                # Always write vcpus equal to the new total vCPU count (cores × sockets).
+                # QEMU requires vcpus ≤ cores × sockets; omitting this leaves stale
+                # vcpus values from prior configs that can block VM start/shutdown.
+                effective_sockets = int(sockets) if sockets is not None else 1
+                total_vcpus = int(cpus) * effective_sockets
+                kwargs = {"cores": int(cpus), "memory": int(ram_mb), "vcpus": total_vcpus}
                 if sockets is not None:
                     kwargs["sockets"] = int(sockets)
                 self.node.qemu(vm_id).config.put(**kwargs)
-                log_msg = f"[VM {vm_id}] Successfully updated resources: {cpus} cores, {ram_mb} MB RAM"
+                log_msg = (
+                    f"[VM {vm_id}] Successfully updated resources: "
+                    f"{cpus} cores, {ram_mb} MB RAM, {total_vcpus} vcpus"
+                )
                 if sockets is not None:
                     log_msg += f", {sockets} sockets"
                 logger.info(log_msg)
@@ -279,7 +287,7 @@ class ProxmoxClient:
                 logger.debug(f"[VM {vm_id}] Could not query pending config: {pending_err}")
 
             return {
-                "cpus": cpus,
+                "cores": cpus,       # cores per socket (from 'cores' config key)
                 "ram_mb": ram_mb,
                 "sockets": sockets,
                 "total_vcpus": cpus * sockets,
