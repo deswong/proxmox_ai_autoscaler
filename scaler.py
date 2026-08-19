@@ -477,7 +477,6 @@ class Scaler:
             current_config = self.px.get_vm_config(vm_id) or {}
         else:
             current_config = {}
-        config_cpus = current_config.get("cpus", alloc_cpus)
         config_ram_mb = current_config.get("ram_mb", alloc_ram_mb)
 
         if sample_count > 0:
@@ -529,11 +528,13 @@ class Scaler:
         # In Proxmox QEMU topology, current total vCPUs = sockets * cores.
         config_sockets = current_config.get("sockets", 1)
         config_cores   = current_config.get("cores", alloc_cpus)   # cores per socket
-        # base_vcpus: use the larger of config-defined vCPUs or the live running count.
-        # The live alloc_cpus (cores×sockets at last boot) guards against an abrupt
-        # scale-down immediately after a sockets topology change is applied but before
-        # the VM has been rebooted to pick up the new pending config.
-        base_vcpus     = max(config_cores * config_sockets, alloc_cpus)
+        # Use the config-defined vCPU count exclusively as the sizing base.
+        # Do NOT mix in alloc_cpus (the live running vcpu count from the status API) —
+        # alloc_cpus can lag behind a pending config change or reflect the hotplugged
+        # vcpu count rather than the full cores×sockets allocation. Including it as a
+        # max() caused needed_cores to escalate on every cycle after a reboot because
+        # the newly active vCPU count became the new multiplier base.
+        base_vcpus     = max(config_cores * config_sockets, 1)
 
         # cpu_basis is percentage demand for the VM (0-100% per VM allocation).
         # Clamp cpu_basis to 100.0% max so historical multi-core RRD metric artifacts
@@ -547,8 +548,16 @@ class Scaler:
             math.ceil((effective_cpu_pct / 100.0) * base_vcpus * (1 + self.cpu_buffer_percent / 100.0))
         )
 
-        # Step cap: prevent single-cycle overprovisioning jumps greater than +2 vCPUs above base_vcpus
-        needed_cores = min(needed_cores, base_vcpus + 2)
+        # Step cap: prevent single-cycle overprovisioning jumps greater than +2 vCPUs.
+        # Cap is relative to base_vcpus (the config-defined count), not alloc_cpus, so
+        # it cannot escalate by more than 2 cores per reboot cycle even under sustained load.
+        step_capped = min(needed_cores, base_vcpus + 2)
+        if step_capped < needed_cores:
+            logger.debug(
+                f"[VM {vm_id}] Step cap applied: needed {needed_cores} cores "
+                f"but limiting to base_vcpus ({base_vcpus}) + 2 = {step_capped}."
+            )
+        needed_cores = step_capped
 
         # Clamp: baseline bounds AND physical host limit so VM can always launch.
         target_cpus = max(
@@ -587,9 +596,15 @@ class Scaler:
             f"blended cpu_basis {cpu_basis:.1f}% + {self.cpu_buffer_percent:.0f}% buffer, "
             f"14-day peak RAM {peak_ram_mb:.0f} MB + {self.ram_buffer_percent:.0f}% headroom."
         )
+        # Only pass sockets when it actually needs correcting.
+        # Always writing sockets=1 even when the active config is already sockets=1
+        # creates unnecessary pending churn. More importantly: if a previous cycle already
+        # wrote sockets=1 as *pending* but the VM hasn't rebooted yet (active=2, pending=1),
+        # re-writing it every cycle extends the window where the mismatch can cause issues.
+        needs_sockets_fix = (config_sockets != target_sockets)
         self.px.update_vm_resources(
             vm_id, target_cpus, target_ram,
-            sockets=target_sockets,  # always pass sockets so vcpus is reset correctly
+            sockets=target_sockets if needs_sockets_fix else None,
         )
         try:
             storage.log_scale_event(

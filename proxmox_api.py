@@ -284,7 +284,10 @@ class ProxmoxClient:
                         elif key == "sockets":
                             sockets = int(item["pending"])
             except Exception as pending_err:
-                logger.debug(f"[VM {vm_id}] Could not query pending config: {pending_err}")
+                logger.warning(
+                    f"[VM {vm_id}] Could not query pending config "
+                    f"(will use active config as baseline): {pending_err}"
+                )
 
             return {
                 "cores": cpus,       # cores per socket (from 'cores' config key)
