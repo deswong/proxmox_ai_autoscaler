@@ -354,8 +354,7 @@ class Scaler:
             target_swap = 0  # VMs manage swap internally; we don't set this
 
         # 6. Apply changes if different from currently allocated.
-        #    Triggers on: CPU change, RAM change (>=32 MB), swap cap change (>=32 MB),
-        #    or swap saturation detected — whichever comes first.
+        #    Triggers on: CPU change, RAM change (>=32 MB), swap cap change (>=32 MB).
         ram_diff = abs(target_ram - current_metrics["allocated_ram_mb"])
         current_swap_alloc = current_metrics.get("allocated_swap_mb", 0.0)
         swap_diff = abs(target_swap - current_swap_alloc) if entity_type == "LXC" else 0.0
@@ -407,20 +406,40 @@ class Scaler:
                     )
                 except Exception as log_err:
                     logger.debug(f"[LXC {entity_id}] Scale event log failed: {log_err}")
-
-                # Check if LXC swap usage exceeds saturation threshold to trigger swap flush
-                swap_alloc_check = current_metrics.get("allocated_swap_mb", target_swap)
-                if swap_alloc_check > 0 and (swap_used / swap_alloc_check * 100.0) >= SWAP_FLUSH_THRESHOLD_PERCENT:
-                    ram_headroom = target_ram - current_usage_mb
-                    if ram_headroom >= swap_used * 1.1:
-                        if hasattr(self.px, "flush_lxc_swap"):
-                            self.px.flush_lxc_swap(entity_id)
             elif entity_type == "VM":
                 self.px.update_vm_resources(entity_id, target_cpus, target_ram)
         else:
             logger.debug(
                 f"[{entity_type} {entity_id}] Resources adequate, no significant scaling required."
             )
+
+        # 7. Swap flush — runs every cycle, independent of whether a scale event fired.
+        #    A container can be swap-saturated while its RAM/CPU allocation is stable
+        #    (no scale event triggers), leaving swap stuck indefinitely. This block
+        #    fires whenever swap saturation exceeds the threshold AND the container has
+        #    enough free RAM headroom to safely absorb the pages back.
+        if entity_type == "LXC" and swap_used > 5:
+            swap_alloc_check = current_metrics.get("allocated_swap_mb", 0.0)
+            if (
+                swap_alloc_check > 0
+                and (swap_used / swap_alloc_check * 100.0) >= SWAP_FLUSH_THRESHOLD_PERCENT
+            ):
+                # Use target_ram (post-scale headroom) to check if flush is safe.
+                # If a scale-up just fired, target_ram already accounts for the new size.
+                ram_headroom = target_ram - current_usage_mb
+                if ram_headroom >= swap_used * 1.1:
+                    logger.info(
+                        f"[LXC {entity_id}] Swap flush triggered: "
+                        f"{swap_used:.0f}/{swap_alloc_check:.0f} MB used "
+                        f"({swap_used/swap_alloc_check*100:.0f}% ≥ {SWAP_FLUSH_THRESHOLD_PERCENT:.0f}% threshold), "
+                        f"RAM headroom {ram_headroom:.0f} MB ≥ {swap_used*1.1:.0f} MB required."
+                    )
+                    self.px.flush_lxc_swap(entity_id)
+                else:
+                    logger.debug(
+                        f"[LXC {entity_id}] Swap flush deferred: headroom "
+                        f"{ram_headroom:.0f} MB < {swap_used*1.1:.0f} MB required to safely absorb swap."
+                    )
 
     def apply_vm_pending_config(
         self,

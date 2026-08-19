@@ -8,6 +8,8 @@ from config import (
     PROXMOX_TOKEN_ID,
     PROXMOX_TOKEN_SECRET,
     NODE_NAME,
+    SWAP_STEP_REDUCTION_MB,
+    SWAP_DRAIN_MB,
 )
 
 # Suppress insecure request warnings if Proxmox uses self-signed certs
@@ -117,6 +119,63 @@ class ProxmoxClient:
                     time.sleep(2**attempt)
                 else:
                     return False
+
+    def flush_lxc_swap(self, lxc_id: str) -> bool:
+        """
+        Nudges the LXC swap cap down by one step (SWAP_STEP_REDUCTION_MB) to create
+        gentle cgroup back-pressure, encouraging the kernel to page active swap blocks
+        back into RAM without forcing a hard synchronous reclaim.
+
+        Safety constraint: the cap is never lowered below current swap usage + 32 MB,
+        preventing the cgroup wall from dropping below live usage (which would cause
+        a stalling kernel reclaim and I/O spike).
+
+        This is safe to call every polling cycle; once swap usage drops below the
+        target, the method becomes a no-op and normal auto-sizing takes over.
+        """
+        if not self.proxmox:
+            return False
+
+        try:
+            config = self.node.lxc(lxc_id).config.get()
+            current_swap_cap = int(config.get("swap", 0))
+
+            # Nothing to drain if already at the drain floor
+            if current_swap_cap <= SWAP_DRAIN_MB:
+                return False
+
+            # Read live swap usage from the status endpoint (more current than bulk list)
+            try:
+                status = self.node.lxc(lxc_id).status.current.get()
+                live_swap_used_mb = int(status.get("swap", 0)) // (1024 * 1024)
+            except Exception:
+                # Fall back to config-only path — skip if we can't read live usage safely
+                logger.debug(f"[LXC {lxc_id}] Swap flush: could not read live swap status, skipping.")
+                return False
+
+            # Hard floor: never go below usage + 32 MB (prevents synchronous kernel stall)
+            safe_floor_mb = max(live_swap_used_mb + 32, SWAP_DRAIN_MB)
+            new_swap_cap = max(current_swap_cap - SWAP_STEP_REDUCTION_MB, safe_floor_mb)
+
+            if new_swap_cap >= current_swap_cap:
+                # Already at or below the safe floor — nothing to reduce
+                logger.debug(
+                    f"[LXC {lxc_id}] Swap flush: cap already at safe floor "
+                    f"({current_swap_cap} MB, usage {live_swap_used_mb} MB). Skipping."
+                )
+                return False
+
+            self.node.lxc(lxc_id).config.put(swap=new_swap_cap)
+            logger.info(
+                f"[LXC {lxc_id}] Swap flush step: cap {current_swap_cap} → {new_swap_cap} MB "
+                f"(usage: {live_swap_used_mb} MB, floor: {safe_floor_mb} MB, "
+                f"step: -{SWAP_STEP_REDUCTION_MB} MB)."
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"[LXC {lxc_id}] Swap flush failed: {e}")
+            return False
 
     def get_lxc_rrd_history(self, lxc_id: str, timeframe: str = "hour") -> list:
         """
