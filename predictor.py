@@ -52,7 +52,7 @@ class Predictor:
     @staticmethod
     def _build_context_features(metrics: list, host_context: dict) -> list:
         """
-        Constructs the 17-element global context vector appended after the
+        Constructs the 18-element global context vector appended after the
         90 per-interval history features. Same layout used by training.
 
         Slots [0-9]  — node health (10 values):
@@ -115,14 +115,14 @@ class Predictor:
         Runs fast inference using pre-trained LightGBM weights.
         Falls back to the latest telemetry reading if no model exists yet.
 
-        Feature vector layout (107 total):
+        Feature vector layout (108 total):
           [0–89]   Per-container history:  6 × 15 intervals
                    cpu%, mem_mb, diskread, diskwrite, netin, netout
           [90–99]  Node health context:    10 scalars
                    host_cpu%, host_ram%, host_swap%, load_1m, load_5m,
                    ksm_mb, cpu_overcommit, ram_overcommit, container_count, reserved
           [100–101] Temporal (LightGBM categoricals): hour_of_day, day_of_week
-          [101–106] Deltas:  6 scalars (last − first of window)
+          [102–107] Deltas:  6 scalars (last − first of window)
         """
         if host_context is None:
             host_context = {}
@@ -197,7 +197,7 @@ class Predictor:
 
         if os.path.exists(cpu_model_path) and os.path.exists(ram_model_path):
             try:
-                # Build 107-feature vector as a 2D numpy array for LightGBM
+                # Build 108-feature vector as a 2D numpy array for LightGBM
                 # (no DMatrix wrapper needed — LightGBM accepts numpy arrays directly)
                 X_features = []
                 for m in metrics:
@@ -209,7 +209,7 @@ class Predictor:
                     X_features.append(m.get("netout", 0.0))
 
                 X_features.extend(self._build_context_features(metrics, host_context))
-                X = np.array([X_features])  # shape (1, 107)
+                X = np.array([X_features])  # shape (1, 108)
 
                 model_cpu = self._get_model(cpu_model_path)
                 model_ram = self._get_model(ram_model_path)

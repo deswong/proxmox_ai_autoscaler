@@ -39,6 +39,7 @@ class Scaler:
         baseline: dict,
         predicted: dict,
         current_metrics: dict,
+        host_metrics: dict = None,
     ):
         """
         Evaluates predictions against max/min baselines and overall node health.
@@ -48,6 +49,12 @@ class Scaler:
           < threshold     — normal operation
           threshold–90%   — block scale-ups (existing safety cap)
           > 90% RAM       — block scale-ups AND actively scale down idle containers
+
+        ``host_metrics`` should be the per-cycle host snapshot built in main.py,
+        which carries the worst-case ``committed_cpus`` / ``committed_ram_mb``
+        totals. It is updated in place after a successful resize so that later
+        entities in the same cycle see the reduced budget. If omitted, a fresh
+        (committed-less) snapshot is fetched from the API.
         """
 
         if not current_metrics:
@@ -56,8 +63,10 @@ class Scaler:
             )
             return
 
-        # Fetch live host node metrics early so they are available for all safety guards
-        host_metrics = self.px.get_host_usage()
+        # Use the per-cycle host snapshot when provided (it includes committed totals);
+        # otherwise fall back to a live fetch.
+        if host_metrics is None:
+            host_metrics = self.px.get_host_usage()
         host_ram_pct = host_metrics.get("ram_percent", 0.0)
         host_cpu_pct = host_metrics["cpu_percent"]
         host_swap_pct = host_metrics.get("swap_percent", 0.0)
@@ -307,6 +316,12 @@ class Scaler:
                     int(ram_usage * ACTIVE_SCALEDOWN_HEADROOM_RATIO),
                     baseline["min_ram_mb"],
                 )
+                # Never reclaim below the space needed to page active swap back in —
+                # that would undo the "Natural Reclaim" guard above.
+                if swap_used > 5:
+                    reclaimed_target = max(
+                        reclaimed_target, int(ram_usage + swap_used + 128)
+                    )
                 if reclaimed_target < alloc_ram:
                     logger.warning(
                         f"[{entity_type} {entity_id}] HOST PRESSURE RECLAIM: Host RAM at "
@@ -353,10 +368,29 @@ class Scaler:
         else:
             target_swap = 0  # VMs manage swap internally; we don't set this
 
+        # 5b. Decide up-front whether a swap flush will run this cycle (step 7).
+        #     While flushing, the auto-sizer must not raise the swap cap back up —
+        #     otherwise step 6 re-inflates the cap every cycle and step 7 lowers it
+        #     again, producing two config writes per minute indefinitely.
+        flush_swap = False
+        current_swap_alloc = current_metrics.get("allocated_swap_mb", 0.0)
+        if entity_type == "LXC" and swap_used > 5 and current_swap_alloc > 0:
+            swap_saturation_pct = swap_used / current_swap_alloc * 100.0
+            ram_headroom = target_ram - current_usage_mb
+            if swap_saturation_pct >= SWAP_FLUSH_THRESHOLD_PERCENT:
+                if ram_headroom >= swap_used * 1.1:
+                    flush_swap = True
+                    if target_swap > current_swap_alloc:
+                        target_swap = int(current_swap_alloc)
+                else:
+                    logger.debug(
+                        f"[LXC {entity_id}] Swap flush deferred: headroom "
+                        f"{ram_headroom:.0f} MB < {swap_used*1.1:.0f} MB required to safely absorb swap."
+                    )
+
         # 6. Apply changes if different from currently allocated.
         #    Triggers on: CPU change, RAM change (>=32 MB), swap cap change (>=32 MB).
         ram_diff = abs(target_ram - current_metrics["allocated_ram_mb"])
-        current_swap_alloc = current_metrics.get("allocated_swap_mb", 0.0)
         swap_diff = abs(target_swap - current_swap_alloc) if entity_type == "LXC" else 0.0
 
         if (
@@ -384,12 +418,23 @@ class Scaler:
             )
 
             if entity_type == "LXC":
-                self.px.update_lxc_resources(
+                ok = self.px.update_lxc_resources(
                     entity_id, target_cpus, target_ram, swap_mb=target_swap
                 )
+            else:
+                ok = self.px.update_vm_resources(entity_id, target_cpus, target_ram)
+
+            if ok:
+                self._consume_committed_budget(
+                    host_metrics,
+                    target_cpus - current_metrics["allocated_cpus"],
+                    target_ram - current_metrics["allocated_ram_mb"],
+                )
+
+            if entity_type == "LXC" and ok:
                 trigger = (
                     "host_pressure"
-                    if host_metrics.get("ram_percent", 0) > HOST_RAM_ACTIVE_SCALEDOWN_THRESHOLD
+                    if host_ram_pct > HOST_RAM_ACTIVE_SCALEDOWN_THRESHOLD
                     else "prediction"
                 )
                 try:
@@ -401,13 +446,14 @@ class Scaler:
                         ram_before_mb=current_metrics["allocated_ram_mb"],
                         ram_after_mb=target_ram,
                         trigger=trigger,
-                        swap_before_mb=float(current_metrics.get("swap_mb", 0.0)),
+                        # Compare cap-to-cap. Previously this logged live swap *usage*
+                        # as "before" against the new *cap* as "after", which made the
+                        # report's "net swap freed" figure meaningless.
+                        swap_before_mb=float(current_swap_alloc),
                         swap_after_mb=float(target_swap),
                     )
                 except Exception as log_err:
                     logger.debug(f"[LXC {entity_id}] Scale event log failed: {log_err}")
-            elif entity_type == "VM":
-                self.px.update_vm_resources(entity_id, target_cpus, target_ram)
         else:
             logger.debug(
                 f"[{entity_type} {entity_id}] Resources adequate, no significant scaling required."
@@ -415,31 +461,28 @@ class Scaler:
 
         # 7. Swap flush — runs every cycle, independent of whether a scale event fired.
         #    A container can be swap-saturated while its RAM/CPU allocation is stable
-        #    (no scale event triggers), leaving swap stuck indefinitely. This block
-        #    fires whenever swap saturation exceeds the threshold AND the container has
-        #    enough free RAM headroom to safely absorb the pages back.
-        if entity_type == "LXC" and swap_used > 5:
-            swap_alloc_check = current_metrics.get("allocated_swap_mb", 0.0)
-            if (
-                swap_alloc_check > 0
-                and (swap_used / swap_alloc_check * 100.0) >= SWAP_FLUSH_THRESHOLD_PERCENT
-            ):
-                # Use target_ram (post-scale headroom) to check if flush is safe.
-                # If a scale-up just fired, target_ram already accounts for the new size.
-                ram_headroom = target_ram - current_usage_mb
-                if ram_headroom >= swap_used * 1.1:
-                    logger.info(
-                        f"[LXC {entity_id}] Swap flush triggered: "
-                        f"{swap_used:.0f}/{swap_alloc_check:.0f} MB used "
-                        f"({swap_used/swap_alloc_check*100:.0f}% ≥ {SWAP_FLUSH_THRESHOLD_PERCENT:.0f}% threshold), "
-                        f"RAM headroom {ram_headroom:.0f} MB ≥ {swap_used*1.1:.0f} MB required."
-                    )
-                    self.px.flush_lxc_swap(entity_id)
-                else:
-                    logger.debug(
-                        f"[LXC {entity_id}] Swap flush deferred: headroom "
-                        f"{ram_headroom:.0f} MB < {swap_used*1.1:.0f} MB required to safely absorb swap."
-                    )
+        #    (no scale event triggers), leaving swap stuck indefinitely. The decision
+        #    (saturation threshold + enough RAM headroom to absorb the pages) was made
+        #    in step 5b so the auto-sizer could be held back while flushing.
+        if flush_swap:
+            logger.info(
+                f"[LXC {entity_id}] Swap flush triggered: "
+                f"{swap_used:.0f}/{current_swap_alloc:.0f} MB used "
+                f"(≥ {SWAP_FLUSH_THRESHOLD_PERCENT:.0f}% threshold), "
+                f"RAM headroom {target_ram - current_usage_mb:.0f} MB ≥ {swap_used*1.1:.0f} MB required."
+            )
+            self.px.flush_lxc_swap(entity_id)
+
+    @staticmethod
+    def _consume_committed_budget(host_metrics: dict, cpu_delta: float, ram_delta_mb: float):
+        """
+        Reflects a successful resize in the shared per-cycle committed totals so the
+        next entity evaluated in the same cycle cannot spend the same headroom.
+        """
+        if "committed_cpus" in host_metrics:
+            host_metrics["committed_cpus"] += cpu_delta
+        if "committed_ram_mb" in host_metrics:
+            host_metrics["committed_ram_mb"] += ram_delta_mb
 
     def apply_vm_pending_config(
         self,
@@ -448,6 +491,7 @@ class Scaler:
         predicted: dict,
         current_metrics: dict,
         rolling_peaks: dict,
+        host_metrics: dict = None,
     ):
         """
         Computes the optimal CPU / RAM sizing for a VM using a blended 14-day
@@ -488,7 +532,8 @@ class Scaler:
         # Hard ceiling: never schedule more vCPUs than the host physically has.
         # This prevents a VM from failing to launch on the next boot because the
         # config demands cores the hypervisor cannot provide.
-        host_metrics = self.px.get_host_usage()
+        if host_metrics is None:
+            host_metrics = self.px.get_host_usage()
         physical_cpus = max(int(host_metrics.get("physical_cpus", alloc_cpus)), 1)
 
         # Fetch actual configuration from API to avoid logging changes that are already pending
@@ -620,11 +665,13 @@ class Scaler:
         # creates unnecessary pending churn. More importantly: if a previous cycle already
         # wrote sockets=1 as *pending* but the VM hasn't rebooted yet (active=2, pending=1),
         # re-writing it every cycle extends the window where the mismatch can cause issues.
-        needs_sockets_fix = (config_sockets != target_sockets)
-        self.px.update_vm_resources(
+        needs_sockets_fix = config_sockets != target_sockets
+        ok = self.px.update_vm_resources(
             vm_id, target_cpus, target_ram,
             sockets=target_sockets if needs_sockets_fix else None,
         )
+        if not ok:
+            return
         try:
             storage.log_scale_event(
                 entity_id=vm_id,
