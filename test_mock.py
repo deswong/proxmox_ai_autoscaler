@@ -1,3 +1,4 @@
+# pylint: disable=too-many-lines
 import os
 import time
 import tempfile
@@ -1068,7 +1069,7 @@ def test_scaler_uses_cycle_committed_budget():
             return {"cpu_percent": 10.0, "ram_percent": 30.0, "total_ram_mb": 10000.0}
 
         def update_lxc_resources(self, _lxc_id, cpus, ram_mb, swap_mb=0):
-            self.updates.append({"cpus": cpus, "ram_mb": ram_mb})
+            self.updates.append({"cpus": cpus, "ram_mb": ram_mb, "swap_mb": swap_mb})
             return True
 
     px = MockProxmoxClient()
@@ -1232,4 +1233,3 @@ if __name__ == "__main__":
     test_dynamic_baseline_anchored_to_initial_allocation()
     test_notes_not_overwritten_on_read_failure()
     print("All mock tests passed!")
-

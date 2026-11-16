@@ -665,7 +665,7 @@ class Scaler:
         # creates unnecessary pending churn. More importantly: if a previous cycle already
         # wrote sockets=1 as *pending* but the VM hasn't rebooted yet (active=2, pending=1),
         # re-writing it every cycle extends the window where the mismatch can cause issues.
-        needs_sockets_fix = (config_sockets != target_sockets)
+        needs_sockets_fix = config_sockets != target_sockets
         ok = self.px.update_vm_resources(
             vm_id, target_cpus, target_ram,
             sockets=target_sockets if needs_sockets_fix else None,
