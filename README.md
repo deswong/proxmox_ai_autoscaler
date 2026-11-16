@@ -16,7 +16,7 @@ Zero database tuning, zero Prometheus stacks — just one service keeping your P
 |---|---|
 | **Proactive ML Scaling (LXC)** | LightGBM DART booster forecasts resource needs 2 minutes ahead — before spikes degrade performance |
 | **VM Right-Sizing (next reboot)** | Computes optimal CPU/RAM from 14-day observed peaks + 30% headroom; writes as pending Proxmox config |
-| **107-Feature Prediction Engine** | Reads CPU, RAM, disk I/O, network I/O, host load averages, overcommit ratios, time-of-day (as native categoricals), and rate-of-change trends simultaneously |
+| **108-Feature Prediction Engine** | Reads CPU, RAM, disk I/O, network I/O, host load averages, overcommit ratios, time-of-day (as native categoricals), and rate-of-change trends simultaneously |
 | **MAE Penalty-Weighted Training** | Nightly retraining boosts sample weight (1×–3×) for intervals where predictions were most wrong — models self-correct over time |
 | **Performance Reporting** | Every scaling action is logged with before/after values. `report.py` shows savings (RAM freed, CPU freed), scale counts, and per-entity prediction accuracy |
 | **Host-Aware Scaling** | Three-tier host pressure response: normal → block scale-ups → actively reclaim RAM from idle containers |
@@ -30,9 +30,9 @@ Zero database tuning, zero Prometheus stacks — just one service keeping your P
 
 ## 🧠 How it Works
 
-### 1. The LightGBM Prediction Engine (107 Features)
+### 1. The LightGBM Prediction Engine (108 Features)
 
-The system learns *patterns*, not just thresholds. The feature vector fed to LightGBM has **107 inputs** per prediction:
+The system learns *patterns*, not just thresholds. The feature vector fed to LightGBM has **108 inputs** per prediction:
 
 ```
 [0-89]   Per-container history (15 intervals × 6 metrics):
@@ -46,7 +46,7 @@ The system learns *patterns*, not just thresholds. The feature vector fed to Lig
 [100-101] Temporal context:
            hour_of_day (0–23), day_of_week (0=Mon…6=Sun)
 
-[101-106] Rate-of-change deltas (last − first of the 15-minute window):
+[102-107] Rate-of-change deltas (last − first of the 15-minute window):
            Δcpu%, Δram_mb, Δdiskread, Δdiskwrite, Δnetin, Δnetout
 ```
 
@@ -180,6 +180,19 @@ EXCLUDED_LXCS=101,102
 EXCLUDED_VMS=200
 ```
 
+Containers without an explicit baseline get a **dynamic baseline** anchored to their *original* allocation (recorded in the Proxmox Notes on first detection as `[Proxmox AI Autoscaler - Initial Allocation]`):
+
+| Bound | Dynamic value |
+|---|---|
+| `min_cpus` | 1 |
+| `min_ram_mb` | original RAM (floor 128 MB LXC / 1024 MB VM) |
+| `max_cpus` | original cores + 4 (never below current) |
+| `max_ram_mb` | 2 × original RAM (never below current) |
+
+Edit the numbers in the Notes stamp to re-anchor a container.
+
+> **Worst-case capacity guard:** scale-ups are refused or clamped if the total *configured* allocation across all LXCs and VMs (running **and** stopped) would exceed `MAX_HOST_CPU_ALLOCATION_PERCENT` of physical CPUs, or total RAM minus `HOST_RAM_RESERVE_PERCENT`. Look for `WORST-CASE CPU CAP` / `WORST-CASE RAM CAP` in the log.
+
 > **VM note:** Proxmox enforces a 1024 MB minimum for VM memory. The autoscaler does *not* live-hotplug VMs — it writes optimal sizing as a pending config that applies on the next reboot, based on the VM's observed peak usage over the last 14 days.
 
 ### Start the Service
@@ -301,7 +314,10 @@ Stops the service, removes cron jobs, and deletes all files under `/opt/proxmox-
 > The autoscaler holds back during host stress. Once host RAM drops below 85% normal operation resumes. Adjust `MAX_HOST_RAM_ALLOCATION_PERCENT` in `.env` if needed.
 
 **A container was scaled down too aggressively**
-> Check that `min_ram_mb` is configured in `.env`. By default the dynamic baseline anchors `min_ram_mb` to the container's current allocation, preventing shrinkage below provisioned size.
+> Check that `min_ram_mb` is configured in `.env`. By default the dynamic baseline anchors `min_ram_mb` to the container's original allocation (from the Notes stamp), so it never shrinks below what you provisioned.
+
+**Scale-ups are blocked with `WORST-CASE CPU CAP` / `WORST-CASE RAM CAP`**
+> The configured allocations of all entities, including stopped ones, already exceed the host budget. Reduce allocations on stopped guests, or raise `MAX_HOST_CPU_ALLOCATION_PERCENT` / lower `HOST_RAM_RESERVE_PERCENT`.
 
 ---
 

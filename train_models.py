@@ -108,8 +108,8 @@ def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
     #   [90-99]  Node health: host_cpu%, host_ram%, host_swap%, load_1m, load_5m, ksm,
     #            cpu_overcommit, ram_overcommit, container_count, reserved
     #   [100-101] Temporal: hour_of_day, day_of_week
-    #   [101-106] Deltas: Δcpu%, Δmem_mb, Δdiskread, Δdiskwrite, Δnetin, Δnetout
-    #   Total: 107 features
+    #   [102-107] Deltas: Δcpu%, Δmem_mb, Δdiskread, Δdiskwrite, Δnetin, Δnetout
+    #   Total: 108 features
     PREDICTION_HORIZON = 2
     LOOKBACK = 15
 
@@ -128,7 +128,7 @@ def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
             features.append(m.get("netin", 0.0))
             features.append(m.get("netout", 0.0))
 
-        # Append 17 global context features to match the predictor layout exactly.
+        # Append 18 global context features to match the predictor layout exactly.
         # Feature order MUST stay in sync with Predictor._build_context_features().
         window_ts = past_window[-1].get("time", 0)
         host_snap = node_context_by_time.get(
@@ -151,7 +151,7 @@ def train_for_entity(px_client, entity_id, entity_type, models_dir="./models"):
         window_dt = datetime.datetime.fromtimestamp(window_ts) if window_ts else datetime.datetime.now()
         features.append(float(window_dt.hour))     # hour_of_day
         features.append(float(window_dt.weekday())) # day_of_week
-        # [101-106] Rate-of-change deltas (6 values: last - first of window)
+        # [102-107] Rate-of-change deltas (6 values: last - first of window)
         first, last = past_window[0], past_window[-1]
         features.append((last.get("cpu", 0.0) - first.get("cpu", 0.0)) * 100)
         features.append((last.get("mem", 0.0) - first.get("mem", 0.0)) / (1024 * 1024))
@@ -288,8 +288,8 @@ def run():
     all_lxc_ids = px_client.get_all_lxc_ids()
 
     if not all_lxc_ids:
-        logger.warning("No LXCs found on this node. Nothing to train.")
-        return
+        # Don't return here — VMs still need training and logs still need pruning.
+        logger.warning("No LXCs found on this node. Skipping LXC training.")
 
     for lxc_id in all_lxc_ids:
         if lxc_id in EXCLUDED_LXCS:

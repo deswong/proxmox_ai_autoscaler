@@ -208,12 +208,16 @@ class ProxmoxClient:
             logger.error(f"Failed to fetch LXC IDs from node {NODE_NAME}: {e}")
             return []
 
-    def get_entity_notes(self, entity_id: str, entity_type: str) -> str:
+    def get_entity_notes(self, entity_id: str, entity_type: str):
         """
         Retrieves the 'description' field (Notes in UI) for an LXC or VM.
+
+        Returns "" when the entity has no notes, or None when the notes could
+        not be read. Callers MUST NOT write notes back after a None result —
+        doing so would overwrite the user's existing notes.
         """
         if not self.proxmox:
-            return ""
+            return None
 
         try:
             if entity_type == "LXC":
@@ -224,7 +228,7 @@ class ProxmoxClient:
             return config.get("description", "")
         except Exception as e:
             logger.error(f"Failed to fetch notes for {entity_type} {entity_id}: {e}")
-            return ""
+            return None
 
     def set_entity_notes(self, entity_id: str, entity_type: str, notes: str) -> bool:
         """

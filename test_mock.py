@@ -1052,6 +1052,157 @@ def test_evaluate_and_scale_vm_live_hotplug():
     )
 
 
+def test_scaler_uses_cycle_committed_budget():
+    """When main.py passes its per-cycle host_metrics (which include committed totals),
+    the worst-case RAM cap must be enforced, and a successful resize must consume the
+    shared budget so the next entity in the same cycle cannot spend it again."""
+    from scaler import Scaler
+
+    class MockProxmoxClient:
+        def __init__(self):
+            self.updates = []
+            self.host_usage_calls = 0
+
+        def get_host_usage(self):
+            self.host_usage_calls += 1
+            return {"cpu_percent": 10.0, "ram_percent": 30.0, "total_ram_mb": 10000.0}
+
+        def update_lxc_resources(self, _lxc_id, cpus, ram_mb, swap_mb=0):
+            self.updates.append({"cpus": cpus, "ram_mb": ram_mb})
+            return True
+
+    px = MockProxmoxClient()
+    scaler = Scaler(px)
+    # Budget = 10000 * (1 - 15% reserve) = 8500 MB; 8000 already committed → 500 MB left.
+    host_metrics = {
+        "cpu_percent": 10.0, "ram_percent": 30.0, "swap_percent": 0.0,
+        "total_ram_mb": 10000.0, "physical_cpus": 8,
+        "committed_cpus": 4, "committed_ram_mb": 8000.0,
+    }
+    baseline = {"min_cpus": 1, "max_cpus": 4, "min_ram_mb": 512, "max_ram_mb": 8192}
+    predicted = {"cpu_percent": 30.0, "ram_usage_mb": 1800.0, "recent_peak_ram": 1800.0}
+    current = {
+        "allocated_cpus": 1, "allocated_ram_mb": 1024.0, "cpu_percent": 30.0,
+        "ram_usage_mb": 1800.0, "swap_mb": 0.0, "allocated_swap_mb": 256.0,
+    }
+
+    scaler.evaluate_and_scale("700", "LXC", baseline, predicted, dict(current),
+                              host_metrics=host_metrics)
+    print("\nTesting Committed Budget Enforcement:")
+    print(f"  Updates: {px.updates}, committed after: {host_metrics['committed_ram_mb']}")
+
+    assert px.host_usage_calls == 0, "Scaler must reuse the cycle host_metrics, not refetch"
+    assert px.updates[0]["ram_mb"] == 1524, (
+        f"RAM should be clamped to 1024 + 500 MB budget, got {px.updates[0]['ram_mb']}"
+    )
+    assert host_metrics["committed_ram_mb"] == 8500.0, "Budget must be consumed in place"
+
+    # A second container in the same cycle has no budget left.
+    scaler.evaluate_and_scale("701", "LXC", baseline, predicted, dict(current),
+                              host_metrics=host_metrics)
+    assert len(px.updates) == 1 or px.updates[1]["ram_mb"] <= 1024, (
+        f"Second container must not get RAM beyond the exhausted budget: {px.updates}"
+    )
+
+
+def test_scaler_swap_flush_does_not_reinflate_cap():
+    """While a swap flush is active, the auto-sizer must not raise the swap cap above
+    its current value (that caused a write-up / flush-down loop every cycle)."""
+    from scaler import Scaler
+
+    class MockProxmoxClient:
+        def __init__(self):
+            self.last_update = None
+            self.flush_called = False
+
+        def get_host_usage(self):
+            return {"cpu_percent": 10.0, "ram_percent": 30.0, "total_ram_mb": 64000}
+
+        def update_lxc_resources(self, _lxc_id, cpus, ram_mb, swap_mb=0):
+            self.last_update = {"cpus": cpus, "ram_mb": ram_mb, "swap_mb": swap_mb}
+            return True
+
+        def flush_lxc_swap(self, _lxc_id):
+            self.flush_called = True
+            return True
+
+    px = MockProxmoxClient()
+    scaler = Scaler(px)
+    baseline = {"min_cpus": 2, "max_cpus": 2, "min_ram_mb": 4096, "max_ram_mb": 4096}
+    # Cap was just flushed down to 432 MB; recent peak (400 MB) * 1.3 = 520 MB would
+    # previously push it straight back up.
+    predicted = {
+        "cpu_percent": 10.0, "ram_usage_mb": 900.0, "recent_peak_ram": 900.0,
+        "recent_peak_swap": 400.0, "predicted_swap_mb": 400.0,
+    }
+    current = {
+        "allocated_cpus": 2, "allocated_ram_mb": 4096.0, "cpu_percent": 10.0,
+        "ram_usage_mb": 900.0, "swap_mb": 400.0, "allocated_swap_mb": 432.0,
+    }
+    scaler.evaluate_and_scale("702", "LXC", baseline, predicted, current)
+    print("\nTesting Swap Flush Does Not Re-inflate Cap:")
+    print(f"  Update: {px.last_update}, flush called: {px.flush_called}")
+
+    assert px.flush_called, "Flush should run (400/432 MB swap, ample RAM headroom)"
+    assert px.last_update is None or px.last_update["swap_mb"] <= 432, (
+        f"Swap cap must not be raised while flushing, got {px.last_update}"
+    )
+
+
+def test_dynamic_baseline_anchored_to_initial_allocation():
+    """Zero-config baselines must come from the recorded initial allocation, not the
+    current one, so RAM can scale back down and the ceiling doesn't ratchet upward."""
+    import main
+
+    notes = (
+        "user notes\n\n[Proxmox AI Autoscaler - Initial Allocation]\n"
+        "CPU Cores: 2\nRAM: 1024 MB\n"
+    )
+    assert main.parse_initial_allocation(notes) == (2, 1024)
+    assert main.parse_initial_allocation("nothing here") is None
+
+    # Entity has since grown to 1536 MB / 3 cores.
+    current = {"allocated_cpus": 3, "allocated_ram_mb": 1536.0}
+    b = main.build_dynamic_baseline("LXC", (2, 1024), current)
+    print(f"\nTesting Dynamic Baseline Anchoring: {b}")
+    assert b["min_ram_mb"] == 1024, "Floor must be the initial allocation, not current"
+    assert b["max_ram_mb"] == 2048, "Ceiling must be 2x initial, not 2x current"
+    assert b["max_cpus"] == 6
+
+    # Grown past the ceiling already: don't force-shrink below current allocation.
+    big = {"allocated_cpus": 8, "allocated_ram_mb": 4096.0}
+    b = main.build_dynamic_baseline("LXC", (2, 1024), big)
+    assert b["max_ram_mb"] == 4096 and b["max_cpus"] == 8
+
+
+def test_notes_not_overwritten_on_read_failure():
+    """If the notes can't be read, the daemon must not write the stamp (which would
+    replace the user's existing notes with only the stamp)."""
+    import main
+
+    class MockProxmoxClient:
+        def __init__(self, notes):
+            self.notes = notes
+            self.written = None
+
+        def get_entity_notes(self, _id, _type):
+            return self.notes
+
+        def set_entity_notes(self, _id, _type, notes):
+            self.written = notes
+            return True
+
+    current = {"allocated_cpus": 2, "allocated_ram_mb": 2048.0}
+
+    px = MockProxmoxClient(None)
+    assert main.ensure_initial_allocation(px, "100", "LXC", current) == (2, 2048)
+    assert px.written is None, "Must not write notes after a failed read"
+
+    px = MockProxmoxClient("keep me")
+    main.ensure_initial_allocation(px, "100", "LXC", current)
+    assert px.written.startswith("keep me") and "RAM: 2048 MB" in px.written
+
+
 if __name__ == "__main__":
     print("Running Mock AI Predictor Tests...")
     test_scale_event_logging()
@@ -1076,5 +1227,9 @@ if __name__ == "__main__":
     test_vm_sockets_adjustment()
     test_vm_single_core_single_socket_no_overprovision()
     test_evaluate_and_scale_vm_live_hotplug()
+    test_scaler_uses_cycle_committed_budget()
+    test_scaler_swap_flush_does_not_reinflate_cap()
+    test_dynamic_baseline_anchored_to_initial_allocation()
+    test_notes_not_overwritten_on_read_failure()
     print("All mock tests passed!")
 

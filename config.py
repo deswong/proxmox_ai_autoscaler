@@ -1,39 +1,42 @@
 import os
+import re
 import logging
 import logging.handlers
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Setup logging
-log_formatter = logging.Formatter(
-    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger("proxmox_autoscaler")
-logger.setLevel(logging.INFO)
-
-# Console Handler
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(log_formatter)
-logger.addHandler(console_handler)
-
-# Attempt to configure Rotating File Handler for /var/log
 LOG_FILE_PATH = "/var/log/proxmox_ai_autoscaler.log"
-try:
-    file_handler = logging.handlers.RotatingFileHandler(
-        LOG_FILE_PATH, maxBytes=5 * 1024 * 1024, backupCount=3
-    )
-    file_handler.setFormatter(log_formatter)
-    logger.addHandler(file_handler)
-except PermissionError:
-    logger.warning(
-        f"Permission denied to write to {LOG_FILE_PATH}. Logging to console only until permissions are fixed by install script."
-    )
-except Exception as e:
-    logger.error(f"Failed to setup file logging at {LOG_FILE_PATH}: {e}")
+LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
-# Map logger globally for this module
 logger = logging.getLogger("config")
+
+
+def setup_file_logging():
+    """
+    Attaches a rotating file handler to the ROOT logger so that every module
+    logger (main, scaler, proxmox_api, predictor, storage, ...) is captured.
+
+    Only the long-running daemon should call this. The nightly trainer is run
+    from cron with stdout/stderr already redirected into the same file, so
+    attaching a handler there would duplicate every line.
+    """
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    try:
+        file_handler = logging.handlers.RotatingFileHandler(
+            LOG_FILE_PATH, maxBytes=5 * 1024 * 1024, backupCount=3
+        )
+        file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        root.addHandler(file_handler)
+    except PermissionError:
+        logger.warning(
+            f"Permission denied to write to {LOG_FILE_PATH}. Logging to console only "
+            "until permissions are fixed by install script."
+        )
+    except Exception as e:
+        logger.error(f"Failed to setup file logging at {LOG_FILE_PATH}: {e}")
+
 
 # Proxmox Credentials
 PROXMOX_HOST = os.getenv("PROXMOX_HOST", "127.0.0.1")
@@ -90,8 +93,13 @@ TRAINING_DAYS_LOOKBACK = int(os.getenv("TRAINING_DAYS_LOOKBACK", 7))
 INITIAL_LXC_CONFIGS = {}
 INITIAL_VM_CONFIGS = {}
 
+# Only keys of the form LXC_<numeric id> / VM_<numeric id> are entity baselines.
+# Settings such as LXC_TARGET_SWAP_MB / LXC_MIN_SWAP_MB share the prefix and must
+# not be parsed (they previously produced a spurious warning on every start).
+_ENTITY_KEY_RE = re.compile(r"^(LXC|VM)_(\d+)$")
+
 for key, value in os.environ.items():
-    if key.startswith("LXC_") or key.startswith("VM_"):
+    if _ENTITY_KEY_RE.match(key):
         try:
             parts = value.split(",")
             if len(parts) == 4:
